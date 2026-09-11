@@ -13,7 +13,12 @@ from northstar_core.domain.value_objects import ListingStatus, Tradability
 from northstar_core.foundation.value_objects import Currency, ExchangeCode, PointInTime, Symbol
 from northstar_core.strategy import Strategy, StrategyIdentity
 
-from northstar_api.schemas.analysis import AnalyzeAssetRequest, AnalyzeAssetResponse
+from northstar_api.schemas.analysis import (
+    AnalyzeAssetRequest,
+    AnalyzeAssetResponse,
+    ExplanationReasonResponse,
+    RecommendationExplanationResponse,
+)
 
 router = APIRouter()
 
@@ -60,10 +65,10 @@ _ANALYZE_USE_CASE = AnalyzeAssetUseCase(
 
 @router.post("/analyze", response_model=AnalyzeAssetResponse)
 def analyze_asset(request: AnalyzeAssetRequest) -> AnalyzeAssetResponse:
-    """Analyze one asset symbol and return the current domain recommendation."""
+    """Analyze one asset symbol and return its recommendation and explanation."""
     try:
         symbol = Symbol(request.symbol)
-        recommendation = _ANALYZE_USE_CASE.execute(symbol)
+        result = _ANALYZE_USE_CASE.execute(symbol)
     except LookupError as exc:
         raise HTTPException(status_code=status.HTTP_404, detail="Unknown symbol.") from exc
     except (TypeError, ValueError) as exc:
@@ -72,6 +77,15 @@ def analyze_asset(request: AnalyzeAssetRequest) -> AnalyzeAssetResponse:
         raise HTTPException(status_code=status.HTTP_500, detail="Application failure.") from exc
 
     return AnalyzeAssetResponse(
-        symbol=recommendation.asset_analysis.listing.instrument.symbol.value,
-        recommendation=recommendation.action.value,
+        symbol=result.recommendation.asset_analysis.listing.instrument.symbol.value,
+        recommendation=result.recommendation.action.value,
+        explanation=RecommendationExplanationResponse(
+            reasons=tuple(
+                ExplanationReasonResponse(
+                    rationale=reason.rationale,
+                    supporting_signals=reason.supporting_signals,
+                )
+                for reason in result.explanation.reasons
+            )
+        ),
     )

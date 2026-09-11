@@ -27,7 +27,21 @@ class AnalyzeAssetRequest(BaseModel):
 
 
 class AnalyzeAssetResponse(BaseModel):
-    """Public response for a single-asset recommendation."""
+    """Public response for a single-asset recommendation and explanation."""
 
     symbol: str
     recommendation: str
+    explanation: RecommendationExplanationResponse
+
+
+class ExplanationReasonResponse(BaseModel):
+    """One structured reason supporting a recommendation."""
+
+    rationale: str
+    supporting_signals: tuple[str, ...]
+
+
+class RecommendationExplanationResponse(BaseModel):
+    """Structured explanation supporting a recommendation."""
+
+    reasons: tuple[ExplanationReasonResponse, ...]
