@@ -1,13 +1,22 @@
 [project]
 name = "northstar-api"
 version = "0.1.0"
-description = "Add your description here"
+description = "Northstar API layer for the Intelligence MVP"
 readme = "README.md"
 authors = [
     { name = "Dhruba1010", email = "dhrubasinha096p@gmail.com" }
 ]
 requires-python = ">=3.13,<3.14"
-dependencies = []
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
+    "northstar-application",
+    "northstar-core",
+]
+
+[tool.uv.sources]
+northstar-application = { path = "../northstar-application", editable = true }
+northstar-core = { path = "../northstar-core", editable = true }
 
 [project.scripts]
 northstar-api = "northstar_api:main"
