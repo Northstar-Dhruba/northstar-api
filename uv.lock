@@ -102,6 +102,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "northstar-application" },
     { name = "northstar-core" },
+    { name = "northstar-infrastructure" },
     { name = "uvicorn" },
 ]
 
@@ -116,6 +117,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "northstar-application", editable = "../northstar-application" },
     { name = "northstar-core", editable = "../northstar-core" },
+    { name = "northstar-infrastructure", editable = "../northstar-infrastructure" },
     { name = "uvicorn", specifier = ">=0.30.0" },
 ]
 
@@ -148,6 +150,27 @@ version = "0.1.0"
 source = { editable = "../northstar-core" }
 
 [package.metadata]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pytest", specifier = ">=9.1.1" },
+    { name = "ruff", specifier = ">=0.16.1" },
+]
+
+[[package]]
+name = "northstar-infrastructure"
+version = "0.1.0"
+source = { editable = "../northstar-infrastructure" }
+dependencies = [
+    { name = "northstar-application" },
+    { name = "northstar-core" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "northstar-application", editable = "../northstar-application" },
+    { name = "northstar-core", editable = "../northstar-core" },
+]
 
 [package.metadata.requires-dev]
 dev = [

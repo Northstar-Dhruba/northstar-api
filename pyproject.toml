@@ -12,11 +12,13 @@ dependencies = [
     "uvicorn>=0.30.0",
     "northstar-application",
     "northstar-core",
+    "northstar-infrastructure",
 ]
 
 [tool.uv.sources]
 northstar-application = { path = "../northstar-application", editable = true }
 northstar-core = { path = "../northstar-core", editable = true }
+northstar-infrastructure = { path = "../northstar-infrastructure", editable = true }
 
 [project.scripts]
 northstar-api = "northstar_api:main"
