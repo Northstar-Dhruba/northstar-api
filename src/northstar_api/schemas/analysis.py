@@ -26,12 +26,18 @@ class AnalyzeAssetRequest(BaseModel):
         return normalized.upper()
 
 
-class AnalyzeAssetResponse(BaseModel):
-    """Public response for a single-asset recommendation and explanation."""
+class AnalyzeWatchlistRequest(BaseModel):
+    """Ordered symbols requested for one watchlist refresh."""
 
-    symbol: str
-    recommendation: str
-    explanation: RecommendationExplanationResponse
+    symbols: tuple[str, ...]
+
+    @field_validator("symbols")
+    @classmethod
+    def validate_symbols(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        normalized_symbols: list[str] = []
+        for value in values:
+            normalized_symbols.append(Symbol(value).value)
+        return tuple(normalized_symbols)
 
 
 class ExplanationReasonResponse(BaseModel):
@@ -45,3 +51,39 @@ class RecommendationExplanationResponse(BaseModel):
     """Structured explanation supporting a recommendation."""
 
     reasons: tuple[ExplanationReasonResponse, ...]
+
+
+class MarketObservationContextResponse(BaseModel):
+    """Factual observations preserved by the Analyze Asset application result."""
+
+    observed_at: str
+    latest_price: str
+    previous_close: str
+    latest_volume: str
+    daily_high: str
+    daily_low: str
+    recent_closes: tuple[str, ...]
+    recent_volumes: tuple[str, ...]
+
+
+class AnalyzeAssetResponse(BaseModel):
+    """Public response for a single-asset recommendation and explanation."""
+
+    symbol: str
+    recommendation: str
+    explanation: RecommendationExplanationResponse
+    market_observation_context: MarketObservationContextResponse
+
+
+class AnalyzeWatchlistItemResponse(BaseModel):
+    """One ordered watchlist refresh outcome."""
+
+    symbol: str
+    result: AnalyzeAssetResponse | None = None
+    error: str | None = None
+
+
+class AnalyzeWatchlistResponse(BaseModel):
+    """Ordered outcomes returned by a watchlist refresh."""
+
+    items: tuple[AnalyzeWatchlistItemResponse, ...]

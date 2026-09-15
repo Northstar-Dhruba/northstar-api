@@ -1,72 +1,37 @@
 # Northstar API
 
-Northstar API is the orchestration layer of the Northstar platform.
+`northstar-api` is the thin HTTP delivery layer for the Northstar Intelligence Alpha.
 
-It exposes REST APIs, schedules jobs, communicates with external services, manages persistence, and coordinates all platform components.
+## Implemented Alpha API
 
----
+- `POST /analyze`: analyzes one asset symbol and returns Recommendation, RecommendationExplanation, and MarketObservationContext.
+- `POST /watchlist/refresh`: analyzes an ordered collection of symbols through the existing AnalyzeWatchlistUseCase and preserves partial results and stable failure codes.
+- Request validation through Pydantic schemas.
+- Generic transport-safe handling for unknown symbols, invalid requests, and application/provider failures.
+- FastAPI package entry point via `uv run python -m northstar_api`.
 
-## Responsibilities
+The router delegates to Application workflows and serializes their results. It does not calculate recommendations, interpret market evidence, or communicate with providers directly.
 
-- REST APIs
-- Authentication
-- Scheduler
-- Database
-- Notifications
-- Market Data Collection
-- Broker Integrations
-- Logging
-- Configuration
-- User Management
+## Dependencies
 
----
+The API composes:
 
-## Non-Responsibilities
+- `northstar-application` for use-case orchestration;
+- `northstar-core` for Domain contracts and values;
+- `northstar-infrastructure` for the Yahoo Finance observation adapter.
 
-Northstar API does **not** contain:
+## Future API Capabilities
 
-- Trading Logic
-- Technical Indicators
-- Strategy Calculations
-- Risk Algorithms
-- Backtesting Logic
+The following are not implemented in Alpha:
 
-These belong inside **northstar-core**.
+- authentication and authorization;
+- portfolio endpoints;
+- execution endpoints;
+- notifications and alerts;
+- opportunity ranking and Today's Opportunities;
+- persistence and user-owned watchlists;
+- rate limiting, metrics, and telemetry.
 
----
+## Development
 
-## Design Principles
-
-- Thin API Layer
-- Dependency Injection
-- Modular Services
-- Clean Architecture
-- Infrastructure Layer
-
----
-
-## Repository Structure
-
-```
-app/
-tests/
-scripts/
-```
-
----
-
-## Future Integrations
-
-- Yahoo Finance
-- Polygon.io
-- NSE
-- Zerodha
-- WhatsApp
-- Telegram
-- Email
-
----
-
-## License
-
-Private
+See [DEVELOPMENT.md](DEVELOPMENT.md) for setup and validation commands. Contribution and review expectations are documented in [CONTRIBUTING.md](CONTRIBUTING.md).
