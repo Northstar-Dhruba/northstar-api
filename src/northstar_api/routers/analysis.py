@@ -36,7 +36,7 @@ _ANALYZE_WATCHLIST_USE_CASE = AnalyzeWatchlistUseCase(_ANALYZE_USE_CASE)
 
 def _serialize_analyze_asset_result(result: AnalyzeAssetResult) -> AnalyzeAssetResponse:
     return AnalyzeAssetResponse(
-        symbol=result.recommendation.asset_analysis.listing.instrument.symbol.value,
+        symbol=result.recommendation.asset_analysis.listing_reference.symbol.value,
         recommendation=result.recommendation.action.value,
         explanation=RecommendationExplanationResponse(
             reasons=tuple(
