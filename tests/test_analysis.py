@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -17,6 +19,11 @@ from northstar_core.foundation.value_objects import Symbol
 
 from northstar_api.app import app
 from northstar_api.routers import analysis
+from northstar_api.schemas.analysis import (
+    AnalyzeAssetResponse,
+    AnalyzeWatchlistItemResponse,
+    MarketObservationContextResponse,
+)
 
 
 def _yahoo_payload() -> bytes:
@@ -197,3 +204,46 @@ def test_watchlist_refresh_asgi_preserves_partial_failure_code(
     assert status_code == 200
     assert response["items"][0]["result"] is not None
     assert response["items"][1]["error"] == "PROVIDER_UNAVAILABLE"
+
+
+# ---------------------------------------------------------------------------
+# Migration guards
+# ---------------------------------------------------------------------------
+
+
+def test_router_no_longer_reads_the_old_analysis_listing_contract() -> None:
+    source_text = Path(inspect.getfile(analysis)).read_text(encoding="utf-8")
+
+    assert "asset_analysis.listing." not in source_text
+    assert ".listing.instrument" not in source_text
+    assert "asset_analysis.listing_reference.symbol.value" in source_text
+
+
+def test_public_response_schema_is_unchanged() -> None:
+    assert set(AnalyzeAssetResponse.model_fields) == {
+        "symbol",
+        "recommendation",
+        "explanation",
+        "market_observation_context",
+    }
+    assert set(MarketObservationContextResponse.model_fields) == {
+        "observed_at",
+        "latest_price",
+        "previous_close",
+        "latest_volume",
+        "daily_high",
+        "daily_low",
+        "recent_closes",
+        "recent_volumes",
+    }
+    assert set(AnalyzeWatchlistItemResponse.model_fields) == {"symbol", "result", "error"}
+
+
+def test_public_response_exposes_no_listing_or_reference_metadata() -> None:
+    status_code, response = _request("/analyze", {"symbol": "AAPL"})
+
+    assert status_code == 200
+    assert isinstance(response["symbol"], str)
+    for forbidden in ("listing", "listing_reference", "exchange_code", "instrument"):
+        assert forbidden not in response
+        assert forbidden not in response["market_observation_context"]
