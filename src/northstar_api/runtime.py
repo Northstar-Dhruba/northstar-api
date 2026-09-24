@@ -22,6 +22,7 @@ from northstar_application.application_services import (
 )
 from northstar_application.ports import (
     FuturesForwardResearchRecordRepository,
+    FuturesHistoricalMarketDataRepository,
     FuturesPaperFillRepository,
     FuturesPaperOrderRepository,
     FuturesProductEconomicsRepository,
@@ -59,6 +60,7 @@ class DatabaseRuntime:
 
     economics_store: FuturesProductEconomicsStore
     economics_repository: FuturesProductEconomicsRepository
+    market_repository: FuturesHistoricalMarketDataRepository
     forward_repository: FuturesForwardResearchRecordRepository
     order_repository: FuturesPaperOrderRepository
     fill_repository: FuturesPaperFillRepository
@@ -94,6 +96,7 @@ def build_database_runtime(path: Path) -> DatabaseRuntime:
     return DatabaseRuntime(
         economics_store=SQLiteFuturesProductEconomicsStore(path),
         economics_repository=economics,
+        market_repository=market,
         forward_repository=forward,
         order_repository=orders,
         fill_repository=fills,

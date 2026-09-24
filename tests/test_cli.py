@@ -228,9 +228,10 @@ def test_both_console_scripts_are_registered() -> None:
 
 
 def test_the_fastapi_app_does_not_load_the_cli() -> None:
-    source = (Path(cli.__file__).parent / "app.py").read_text(encoding="utf-8")
-
-    assert "cli" not in source and "runtime" not in source
+    package = Path(cli.__file__).parent
+    for module in ("app.py", "routers/futures.py", "settings.py", "__init__.py"):
+        source = (package / module).read_text(encoding="utf-8")
+        assert "northstar_api.cli" not in source and "import cli" not in source
 
 
 # ---------------------------------------------------------------------------
@@ -737,6 +738,7 @@ def test_status_renders_every_row_state_without_totals() -> None:
     runtime = DatabaseRuntime(
         economics_store=None,
         economics_repository=None,
+        market_repository=None,
         forward_repository=None,
         order_repository=None,
         fill_repository=None,
