@@ -40,7 +40,6 @@ from typing import TextIO
 
 from northstar_application.application_services import (
     AcquireFuturesDailyHistoryUseCase,
-    BuildFuturesPaperPortfolioUseCase,
     ForwardResearchContractViolationError,
     FuturesHistoricalDataContractViolationError,
     FuturesPaperPortfolioStrategyConflictError,
@@ -55,9 +54,7 @@ from northstar_application.ports import (
     FuturesForwardResearchRecordQuery,
     FuturesHistoricalMarketDataConflictError,
     FuturesPaperFillConflictError,
-    FuturesPaperFillQuery,
     FuturesPaperOrderConflictError,
-    FuturesPaperOrderQuery,
     FuturesProductEconomicsConflictError,
     FuturesSessionResolutionError,
 )
@@ -402,23 +399,9 @@ def _paper_status(args: argparse.Namespace, context: _Context) -> ExitCode:
     as_of = _as_of(args)
 
     runtime = context.database_runtime(_database(args))
-    missing_economics: str | None = None
-    try:
-        valuation = runtime.valuation.execute(portfolio, strategy, as_of)
-    except FuturesProductEconomicsNotFoundError as error:
-        valuation, missing_economics = None, str(error)
-
-    orders = runtime.order_repository.get_orders(FuturesPaperOrderQuery(portfolio))
-    fills = runtime.fill_repository.get_fills(FuturesPaperFillQuery(portfolio))
-    decided = [o for o in orders if not _is_before(as_of, o.intent.decided_at)]
-    visible = [f for f in fills if not _is_before(as_of, f.filled_at)]
-    filled = {fill.order_identity for fill in visible}
-    pending = tuple(order for order in decided if order.identity not in filled)
-    held = (
-        valuation.portfolio
-        if valuation is not None
-        else BuildFuturesPaperPortfolioUseCase().execute(portfolio, strategy, fills, as_of)
-    )
+    # Whole-portfolio scope only: status selects no contract.
+    snapshot = runtime.snapshot.execute(None, strategy, portfolio, as_of)
+    valuation = snapshot.valuation
 
     context.write(
         [
@@ -426,13 +409,15 @@ def _paper_status(args: argparse.Namespace, context: _Context) -> ExitCode:
             *render.context_lines(
                 strategy=strategy.identity, portfolio=portfolio.identity, cutoff=as_of.value
             ),
-            *render.execution_summary_lines(len(decided), len(visible), pending),
-            *render.portfolio_lines(held),
+            *render.execution_summary_lines(
+                len(snapshot.orders), len(snapshot.fills), snapshot.pending_orders
+            ),
+            *render.portfolio_lines(snapshot.portfolio),
             *(
                 render.pnl_lines(valuation)
                 if valuation is not None
                 else render.pnl_unavailable_lines(
-                    f"product economics not configured: {missing_economics}"
+                    f"product economics not configured for {snapshot.missing_economics}"
                 )
             ),
         ]
