@@ -22,6 +22,7 @@ northstar-infrastructure = { path = "../northstar-infrastructure", editable = tr
 
 [project.scripts]
 northstar-api = "northstar_api:main"
+northstar = "northstar_api.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.12.1,<0.13.0"]
