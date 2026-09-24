@@ -17,6 +17,7 @@ from northstar_application.application_services import (
     AcquireFuturesDailyHistoryUseCase,
     AggregateFuturesDailySessionBarUseCase,
     BuildFuturesPaperTradingValuationUseCase,
+    GetFuturesPaperTradingSnapshotUseCase,
     RunFuturesPaperTradingSessionUseCase,
 )
 from northstar_application.ports import (
@@ -63,6 +64,7 @@ class DatabaseRuntime:
     fill_repository: FuturesPaperFillRepository
     paper_session: RunFuturesPaperTradingSessionUseCase
     valuation: BuildFuturesPaperTradingValuationUseCase
+    snapshot: GetFuturesPaperTradingSnapshotUseCase
 
 
 def initialize_database(path: Path) -> None:
@@ -108,6 +110,13 @@ def build_database_runtime(path: Path) -> DatabaseRuntime:
             order_repository=orders,
             fill_repository=fills,
             market_repository=market,
+            economics_repository=economics,
+        ),
+        snapshot=GetFuturesPaperTradingSnapshotUseCase(
+            market_repository=market,
+            forward_repository=forward,
+            order_repository=orders,
+            fill_repository=fills,
             economics_repository=economics,
         ),
     )

@@ -19,6 +19,7 @@ import pytest
 from northstar_application.application_services import (
     FuturesContractPnl,
     FuturesDailyAcquisitionResult,
+    FuturesPaperTradingSnapshot,
     FuturesPaperTradingValuation,
 )
 from northstar_application.ports import (
@@ -648,11 +649,22 @@ class Returning:
     def execute(self, *args):
         return self.value
 
-    def get_orders(self, query):
-        return self.value
 
-    def get_fills(self, query):
-        return self.value
+def test_status_without_economics_still_shows_the_portfolio(database: Path) -> None:
+    _phase_a(database)
+    _paper_run(database, _at(25))
+    _store_bars(database, _S26)
+    _paper_run(database, _at(26))
+
+    outcome = _paper_status(database, _at(26))
+
+    assert outcome.code == ExitCode.DATA
+    assert "LONG 1 @ 7650" in outcome.out
+    assert "P&L: unavailable" in outcome.out
+    assert "Reason: product economics not configured for ES@CME" in outcome.out
+    assert outcome.err == (
+        "DATA ERROR: P&L unavailable because product economics are not configured.\n"
+    )
 
 
 def _order(order_id: str, contract: FuturesContract, side: OrderSide, contracts: int):
@@ -712,14 +724,25 @@ def test_status_renders_every_row_state_without_totals() -> None:
         _order("o-3", _FESX_DEC, OrderSide.BUY, 1),
     )
     fills = (_fill(orders[0], "100"),)
+    snapshot = FuturesPaperTradingSnapshot(
+        contract=None,
+        portfolio=portfolio,
+        latest_market_bar=None,
+        recent_decisions=(),
+        orders=orders,
+        fills=fills,
+        valuation=valuation,
+        missing_economics=None,
+    )
     runtime = DatabaseRuntime(
         economics_store=None,
         economics_repository=None,
         forward_repository=None,
-        order_repository=Returning(orders),
-        fill_repository=Returning(fills),
+        order_repository=None,
+        fill_repository=None,
         paper_session=None,
-        valuation=Returning(valuation),
+        valuation=None,
+        snapshot=Returning(snapshot),
     )
 
     outcome = _paper_status(Path("unused.sqlite3"), as_of.value, database_runtime=lambda p: runtime)
