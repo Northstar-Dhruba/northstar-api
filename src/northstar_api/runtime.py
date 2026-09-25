@@ -9,8 +9,10 @@ invocations, so a fresh process reconstructs everything from that file.
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Callable
 from contextlib import closing
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from northstar_application.application_services import (
@@ -125,12 +127,22 @@ def build_database_runtime(path: Path) -> DatabaseRuntime:
     )
 
 
-def build_market_sync_runtime(path: Path, api_key: str) -> AcquireFuturesDailyHistoryUseCase:
-    """Initialize the database and wire Databento daily acquisition into it."""
+def build_market_sync_runtime(
+    path: Path, api_key: str, *, clock: Callable[[], datetime] | None = None
+) -> AcquireFuturesDailyHistoryUseCase:
+    """Initialize the database and wire Databento daily acquisition into it.
+
+    Without a clock the adapter's completed-session guard reads the wall clock.
+    """
     initialize_database(path)
+    source = (
+        DatabentoFuturesHistoricalMarketDataSource(api_key)
+        if clock is None
+        else DatabentoFuturesHistoricalMarketDataSource(api_key, clock=clock)
+    )
     return AcquireFuturesDailyHistoryUseCase(
         ExchangeCalendarFuturesTradingSessionResolver(),
-        DatabentoFuturesHistoricalMarketDataSource(api_key),
+        source,
         AggregateFuturesDailySessionBarUseCase(),
         SQLiteFuturesHistoricalMarketDataStore(path),
     )
