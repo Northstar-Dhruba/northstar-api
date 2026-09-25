@@ -1,0 +1,7 @@
+# Paths are relative to the build context, the Northstar workspace root.
+**
+!northstar-web/**
+!northstar-api/deploy/Caddyfile
+northstar-web/.git
+northstar-web/node_modules
+northstar-web/dist

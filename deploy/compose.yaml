@@ -1,0 +1,81 @@
+# One host, one persistent local volume, one API process, one scheduled writer.
+#
+#   docker compose build
+#   docker compose up -d                       # api + web
+#   docker compose run --rm operations         # the daily job (scheduler runs this)
+#
+# Builds use the Northstar workspace root as context so the sibling Python
+# repositories resolve exactly as they do in development.
+
+name: northstar
+
+x-futures-settings: &futures-settings
+  # Must stay on the mounted local volume; never NFS, SMB or object storage.
+  NORTHSTAR_DATABASE: ${NORTHSTAR_DATABASE:-/data/northstar.sqlite3}
+  NORTHSTAR_FUTURES_PRODUCT: ${NORTHSTAR_FUTURES_PRODUCT:?set NORTHSTAR_FUTURES_PRODUCT in .env}
+  NORTHSTAR_FUTURES_EXCHANGE: ${NORTHSTAR_FUTURES_EXCHANGE:?set NORTHSTAR_FUTURES_EXCHANGE in .env}
+  NORTHSTAR_FUTURES_EXPIRATION: ${NORTHSTAR_FUTURES_EXPIRATION:?set NORTHSTAR_FUTURES_EXPIRATION in .env}
+  NORTHSTAR_STRATEGY: ${NORTHSTAR_STRATEGY:?set NORTHSTAR_STRATEGY in .env}
+  NORTHSTAR_PORTFOLIO: ${NORTHSTAR_PORTFOLIO:?set NORTHSTAR_PORTFOLIO in .env}
+  NORTHSTAR_TARGET: ${NORTHSTAR_TARGET:?set NORTHSTAR_TARGET in .env}
+
+services:
+  api:
+    build:
+      context: ../..
+      dockerfile: northstar-api/deploy/Dockerfile.api
+    image: northstar-api:local
+    environment:
+      <<: *futures-settings
+      NORTHSTAR_WEB_ORIGIN: ${NORTHSTAR_WEB_ORIGIN:?set NORTHSTAR_WEB_ORIGIN in .env}
+    volumes:
+      - northstar-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4)
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    restart: unless-stopped
+
+  # Not a long-lived service: each scheduled `run --rm` is the only writer while it lasts.
+  operations:
+    image: northstar-api:local
+    profiles: [operations]
+    command: [northstar, operations, daily]
+    environment:
+      <<: *futures-settings
+      DATABENTO_API_KEY: ${DATABENTO_API_KEY:-}
+    volumes:
+      - northstar-data:/data
+    restart: "no"
+
+  web:
+    build:
+      context: ../..
+      dockerfile: northstar-api/deploy/Dockerfile.web
+    image: northstar-web:local
+    environment:
+      NORTHSTAR_SITE_ADDRESS: ${NORTHSTAR_SITE_ADDRESS:?set NORTHSTAR_SITE_ADDRESS in .env}
+      NORTHSTAR_BASIC_AUTH_USER: ${NORTHSTAR_BASIC_AUTH_USER:?set NORTHSTAR_BASIC_AUTH_USER in .env}
+      NORTHSTAR_BASIC_AUTH_HASH: ${NORTHSTAR_BASIC_AUTH_HASH:?set NORTHSTAR_BASIC_AUTH_HASH in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  northstar-data:
+  caddy-data:
+  caddy-config:

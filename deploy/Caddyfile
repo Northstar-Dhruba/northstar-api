@@ -1,0 +1,37 @@
+{
+	admin off
+}
+
+{$NORTHSTAR_SITE_ADDRESS} {
+	encode zstd gzip
+
+	# There is no application authentication; every path, including the
+	# write-capable equity endpoints, sits behind this boundary.
+	basic_auth {
+		{$NORTHSTAR_BASIC_AUTH_USER} {$NORTHSTAR_BASIC_AUTH_HASH}
+	}
+
+	header {
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy no-referrer
+		-Server
+	}
+
+	# /api/health -> /health, /api/futures/dashboard -> /futures/dashboard.
+	handle_path /api/* {
+		reverse_proxy api:8000
+	}
+
+	# The equity workspace calls these without a base URL.
+	@equity path /analyze /watchlist/refresh
+	handle @equity {
+		reverse_proxy api:8000
+	}
+
+	handle {
+		root * /srv
+		try_files {path} /index.html
+		file_server
+	}
+}
