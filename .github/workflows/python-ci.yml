@@ -1,0 +1,78 @@
+name: Python CI
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          path: northstar-api
+
+      - name: Checkout northstar-core
+        uses: actions/checkout@v4
+        with:
+          repository: Northstar-Dhruba/northstar-core
+          ref: develop
+          path: northstar-core
+          token: ${{ secrets.NORTHSTAR_CI_TOKEN }}
+
+      - name: Checkout northstar-application
+        uses: actions/checkout@v4
+        with:
+          repository: Northstar-Dhruba/northstar-application
+          ref: develop
+          path: northstar-application
+          token: ${{ secrets.NORTHSTAR_CI_TOKEN }}
+
+      - name: Checkout northstar-infrastructure
+        uses: actions/checkout@v4
+        with:
+          repository: Northstar-Dhruba/northstar-infrastructure
+          ref: develop
+          path: northstar-infrastructure
+          token: ${{ secrets.NORTHSTAR_CI_TOKEN }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Verify workspace dependency layout
+        run: |
+          ls -la ../northstar-core
+          ls -la ../northstar-application
+          ls -la ../northstar-infrastructure
+          test -f ../northstar-core/pyproject.toml
+          test -f ../northstar-application/pyproject.toml
+          test -f ../northstar-infrastructure/pyproject.toml
+          echo "northstar-core, northstar-application, and northstar-infrastructure workspace dependencies found"
+        working-directory: northstar-api
+
+      - name: Sync dependencies
+        run: uv sync
+        working-directory: northstar-api
+
+      - name: Run Ruff
+        run: uv run ruff check .
+        working-directory: northstar-api
+
+      - name: Run Ruff Formatter Check
+        run: uv run ruff format --check .
+        working-directory: northstar-api
+
+      - name: Run Tests
+        run: uv run pytest
+        working-directory: northstar-api

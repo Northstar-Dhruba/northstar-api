@@ -1,0 +1,11 @@
+[Unit]
+Description=Northstar daily futures operation
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# The directory holding compose.yaml and .env on the host.
+WorkingDirectory=/opt/northstar/northstar-api/deploy
+ExecStart=/usr/bin/docker compose run --rm --no-deps operations

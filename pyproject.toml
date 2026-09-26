@@ -1,0 +1,55 @@
+[project]
+name = "northstar-api"
+version = "0.1.0"
+description = "Northstar API layer for the Intelligence MVP"
+readme = "README.md"
+authors = [
+    { name = "Dhruba1010", email = "dhrubasinha096p@gmail.com" }
+]
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
+    "northstar-application",
+    "northstar-core",
+    "northstar-infrastructure",
+]
+
+[tool.uv.sources]
+northstar-application = { path = "../northstar-application", editable = true }
+northstar-core = { path = "../northstar-core", editable = true }
+northstar-infrastructure = { path = "../northstar-infrastructure", editable = true }
+
+[project.scripts]
+northstar-api = "northstar_api:main"
+northstar = "northstar_api.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.1,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.16.1",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "F",
+    "I",
+    "UP",
+    "B",
+]
+
+ignore = []
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
