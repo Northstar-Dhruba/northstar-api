@@ -1,0 +1,16 @@
+# Paths are relative to the build context, the Northstar workspace root.
+**/.git
+**/.github
+**/.venv
+**/.vscode
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+**/.mypy_cache
+**/*.sqlite3
+**/.env
+northstar-*/tests
+northstar-*/deploy
+northstar-web
+northstar-docs
+*.code-workspace

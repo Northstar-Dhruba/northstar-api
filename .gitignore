@@ -11,6 +11,9 @@ __pycache__/
 .venv/
 venv/
 
+# Deployment secrets
+deploy/.env
+
 # VS Code
 .vscode/
 

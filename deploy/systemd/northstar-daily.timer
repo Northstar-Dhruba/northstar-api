@@ -1,0 +1,13 @@
+[Unit]
+Description=Schedule the Northstar daily futures operation
+
+[Timer]
+# A deployment choice, not a correctness rule: the job itself checks each
+# session's resolved close. Choose a buffer after the product's normal close
+# so the provider has published the session. Daily runs are safe on
+# non-session days; they find no new completed session.
+OnCalendar=*-*-* 23:30:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target
