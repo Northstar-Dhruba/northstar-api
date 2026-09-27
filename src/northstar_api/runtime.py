@@ -23,12 +23,12 @@ from northstar_application.application_services import (
     RunFuturesPaperTradingSessionUseCase,
 )
 from northstar_application.ports import (
+    FuturesContractEconomicsRepository,
+    FuturesContractEconomicsStore,
     FuturesForwardResearchRecordRepository,
     FuturesHistoricalMarketDataRepository,
     FuturesPaperFillRepository,
     FuturesPaperOrderRepository,
-    FuturesProductEconomicsRepository,
-    FuturesProductEconomicsStore,
 )
 from northstar_infrastructure.market_data import (
     DatabentoFuturesHistoricalMarketDataSource,
@@ -38,17 +38,17 @@ from northstar_infrastructure.market_data import (
     initialize_futures_market_data_schema,
 )
 from northstar_infrastructure.persistence import (
+    SQLiteFuturesContractEconomicsRepository,
+    SQLiteFuturesContractEconomicsStore,
     SQLiteFuturesForwardResearchRecordRepository,
     SQLiteFuturesForwardResearchRecordStore,
     SQLiteFuturesPaperFillRepository,
     SQLiteFuturesPaperFillStore,
     SQLiteFuturesPaperOrderRepository,
     SQLiteFuturesPaperOrderStore,
-    SQLiteFuturesProductEconomicsRepository,
-    SQLiteFuturesProductEconomicsStore,
+    initialize_futures_contract_economics_schema,
     initialize_futures_forward_research_record_schema,
     initialize_futures_paper_trading_schema,
-    initialize_futures_product_economics_schema,
 )
 
 
@@ -60,8 +60,8 @@ class DatabaseConfigurationError(RuntimeError):
 class DatabaseRuntime:
     """Every database-backed port and use case the operational commands need."""
 
-    economics_store: FuturesProductEconomicsStore
-    economics_repository: FuturesProductEconomicsRepository
+    economics_store: FuturesContractEconomicsStore
+    economics_repository: FuturesContractEconomicsRepository
     market_repository: FuturesHistoricalMarketDataRepository
     forward_repository: FuturesForwardResearchRecordRepository
     order_repository: FuturesPaperOrderRepository
@@ -72,7 +72,12 @@ class DatabaseRuntime:
 
 
 def initialize_database(path: Path) -> None:
-    """Create every futures table in one SQLite file through production initializers."""
+    """Create every futures table in one SQLite file through production initializers.
+
+    Economics are the contract-level ``futures_contract_economics`` table. The
+    historical product-level ``futures_product_economics`` table is no longer
+    created; in an existing file it is left exactly as it was and never read.
+    """
     if not path.parent.is_dir():
         raise DatabaseConfigurationError(f"Database directory does not exist: {path.parent}")
     if path.is_dir():
@@ -82,7 +87,7 @@ def initialize_database(path: Path) -> None:
             initialize_futures_market_data_schema(connection)
             initialize_futures_forward_research_record_schema(connection)
             initialize_futures_paper_trading_schema(connection)
-            initialize_futures_product_economics_schema(connection)
+            initialize_futures_contract_economics_schema(connection)
     except sqlite3.Error as exc:
         raise DatabaseConfigurationError(f"Database cannot be opened: {path}") from exc
 
@@ -94,9 +99,9 @@ def build_database_runtime(path: Path) -> DatabaseRuntime:
     forward = SQLiteFuturesForwardResearchRecordRepository(path)
     orders = SQLiteFuturesPaperOrderRepository(path)
     fills = SQLiteFuturesPaperFillRepository(path)
-    economics = SQLiteFuturesProductEconomicsRepository(path)
+    economics = SQLiteFuturesContractEconomicsRepository(path)
     return DatabaseRuntime(
-        economics_store=SQLiteFuturesProductEconomicsStore(path),
+        economics_store=SQLiteFuturesContractEconomicsStore(path),
         economics_repository=economics,
         market_repository=market,
         forward_repository=forward,

@@ -24,7 +24,7 @@ Exit codes:
     2  INPUT          an argument could not be parsed or validated
     3  CONFIGURATION  missing API key or settings, or a database that cannot be opened
     4  DATA           a session not yet complete, no persisted history to extend, or
-                      product economics not configured; for ``paper run`` and
+                      contract economics not configured; for ``paper run`` and
                       ``operations daily`` this means the paper session completed
                       and was persisted but P&L was unavailable
     5  STATE          an immutable conflict, a mixed-strategy portfolio, a
@@ -51,23 +51,23 @@ from typing import TextIO
 from northstar_application.application_services import (
     AcquireFuturesDailyHistoryUseCase,
     ForwardResearchContractViolationError,
+    FuturesContractEconomicsContractViolationError,
+    FuturesContractEconomicsNotFoundError,
     FuturesDailyAcquisitionResult,
     FuturesHistoricalDataContractViolationError,
     FuturesPaperPortfolioStrategyConflictError,
     FuturesPaperTradingContractViolationError,
     FuturesPaperTradingSessionResult,
-    FuturesProductEconomicsContractViolationError,
-    FuturesProductEconomicsNotFoundError,
     InvalidFuturesPaperFillHistoryError,
 )
 from northstar_application.ports import (
+    FuturesContractEconomicsConflictError,
     FuturesDailyHistoricalAcquisitionQuery,
     FuturesForwardResearchRecordConflictError,
     FuturesForwardResearchRecordQuery,
     FuturesHistoricalMarketDataConflictError,
     FuturesPaperFillConflictError,
     FuturesPaperOrderConflictError,
-    FuturesProductEconomicsConflictError,
     FuturesSessionResolutionError,
 )
 from northstar_core.derivatives import ExpirationDate
@@ -80,8 +80,8 @@ from northstar_core.foundation.value_objects import (
 )
 from northstar_core.futures import (
     FuturesContract,
+    FuturesContractEconomics,
     FuturesPointValue,
-    FuturesProductEconomics,
     FuturesProductReference,
 )
 from northstar_core.paper_trading import FuturesContractCount, PaperPortfolioIdentity
@@ -93,9 +93,9 @@ from northstar_infrastructure.market_data import (
     FuturesTradingSessionInProgressError,
 )
 from northstar_infrastructure.persistence import (
+    FuturesContractEconomicsStorageError,
     FuturesForwardResearchStorageError,
     FuturesPaperTradingStorageError,
-    FuturesProductEconomicsStorageError,
 )
 
 from northstar_api import _cli_rendering as render
@@ -154,18 +154,18 @@ _STATE_ERRORS: tuple[type[Exception], ...] = (
     FuturesPaperOrderConflictError,
     FuturesPaperFillConflictError,
     FuturesHistoricalMarketDataConflictError,
-    FuturesProductEconomicsConflictError,
+    FuturesContractEconomicsConflictError,
     FuturesPaperPortfolioStrategyConflictError,
     FuturesPaperTradingContractViolationError,
     ForwardResearchContractViolationError,
-    FuturesProductEconomicsContractViolationError,
+    FuturesContractEconomicsContractViolationError,
     FuturesHistoricalDataContractViolationError,
     InvalidFuturesPaperFillHistoryError,
     # One type covers unavailable and corrupt storage; the opened path was already checked.
     FuturesHistoricalStorageError,
     FuturesForwardResearchStorageError,
     FuturesPaperTradingStorageError,
-    FuturesProductEconomicsStorageError,
+    FuturesContractEconomicsStorageError,
 )
 _PROVIDER_ERRORS: tuple[type[Exception], ...] = (
     DatabentoFuturesHistoricalMarketDataSourceError,
@@ -270,13 +270,13 @@ def _is_before(left: PointInTime, right: PointInTime) -> bool:
 
 
 def _economics_set(args: argparse.Namespace, context: _Context) -> ExitCode:
-    reference = _product(args)
+    contract = _contract(args)
     amount = _parse("point value", args.point_value, _decimal)
     currency = _parse("currency", args.currency, Currency)
     point_value = _parse(
         "point value", args.point_value, lambda _: FuturesPointValue(amount, currency)
     )
-    economics = FuturesProductEconomics(reference, point_value)
+    economics = FuturesContractEconomics(contract, point_value)
 
     accepted = context.database_runtime(_database(args)).economics_store.store((economics,))
     if isinstance(accepted, bool) or accepted != 1:
@@ -294,14 +294,14 @@ def _economics_set(args: argparse.Namespace, context: _Context) -> ExitCode:
 
 
 def _economics_show(args: argparse.Namespace, context: _Context) -> ExitCode:
-    reference = _product(args)
+    contract = _contract(args)
     economics = context.database_runtime(_database(args)).economics_repository.get_economics(
-        reference
+        contract
     )
     if economics is None:
         raise CommandError(
             ExitCode.DATA,
-            f"Product economics not configured for {reference}. "
+            f"Contract economics not configured for {contract}. "
             "Use 'northstar economics set' to configure them.",
         )
     context.write(render.economics_lines(economics))
@@ -443,10 +443,12 @@ def _run_paper_session(
     )
     try:
         valuation = runtime.valuation.execute(portfolio, strategy, as_of)
-    except FuturesProductEconomicsNotFoundError as error:
-        context.write(render.pnl_unavailable_lines(f"product economics not configured: {error}"))
+    except FuturesContractEconomicsNotFoundError as error:
+        context.write(
+            render.pnl_unavailable_lines(f"contract economics not configured for {error.contract}")
+        )
         context.warn(
-            "DATA ERROR: P&L unavailable because product economics are not configured. "
+            "DATA ERROR: P&L unavailable because contract economics are not configured. "
             "The paper session above completed and its facts were persisted. "
             "Use 'northstar economics set', then 'northstar paper status'."
         )
@@ -491,13 +493,13 @@ def _paper_status(args: argparse.Namespace, context: _Context) -> ExitCode:
                 render.pnl_lines(valuation)
                 if valuation is not None
                 else render.pnl_unavailable_lines(
-                    f"product economics not configured for {snapshot.missing_economics}"
+                    f"contract economics not configured for {snapshot.missing_economics}"
                 )
             ),
         ]
     )
     if valuation is None:
-        context.warn("DATA ERROR: P&L unavailable because product economics are not configured.")
+        context.warn("DATA ERROR: P&L unavailable because contract economics are not configured.")
         return ExitCode.DATA
     return ExitCode.SUCCESS
 
@@ -588,7 +590,7 @@ def _daily_operation(context: _Context, log: logging.Logger) -> FuturesDailyOper
         log.info("valuation available")
     else:
         log.warning(
-            "execution complete; P&L unavailable because product economics are not configured"
+            "execution complete; P&L unavailable because contract economics are not configured"
         )
     return FuturesDailyOperationResult(
         captured_at=captured,
@@ -626,8 +628,8 @@ def _add_database(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_product(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--product", required=True, help="product code, e.g. ES")
-    parser.add_argument("--exchange", required=True, help="exchange code, e.g. CME")
+    parser.add_argument("--product", required=True, help="product code, e.g. ES or NIFTY")
+    parser.add_argument("--exchange", required=True, help="exchange code, e.g. CME or NSE")
 
 
 def _add_contract(parser: argparse.ArgumentParser) -> None:
@@ -657,19 +659,30 @@ def build_parser() -> argparse.ArgumentParser:
         dest="group", required=True, metavar="{economics,market-data,paper,operations}"
     )
 
-    economics = groups.add_parser("economics", help="configure product economics")
+    economics = groups.add_parser("economics", help="configure the economics of one dated contract")
     economics_commands = economics.add_subparsers(dest="command", required=True)
-    set_parser = economics_commands.add_parser("set", help="store product economics once")
-    _add_database(set_parser)
-    _add_product(set_parser)
-    set_parser.add_argument(
-        "--point-value", required=True, help="currency per 1.0 quote point per contract"
+    set_parser = economics_commands.add_parser(
+        "set", help="store one dated contract's economics once"
     )
-    set_parser.add_argument("--currency", required=True, help="settlement currency, e.g. USD")
+    _add_database(set_parser)
+    _add_contract(set_parser)
+    set_parser.add_argument(
+        "--point-value",
+        required=True,
+        help=(
+            "currency per 1.0 quote point per contract, for this expiration only, "
+            "e.g. 50 for ES or 65 for a NIFTY lot of 65"
+        ),
+    )
+    set_parser.add_argument(
+        "--currency", required=True, help="settlement currency, e.g. USD or INR"
+    )
     set_parser.set_defaults(handler=_economics_set)
-    show_parser = economics_commands.add_parser("show", help="show stored product economics")
+    show_parser = economics_commands.add_parser(
+        "show", help="show one dated contract's stored economics"
+    )
     _add_database(show_parser)
-    _add_product(show_parser)
+    _add_contract(show_parser)
     show_parser.set_defaults(handler=_economics_show)
 
     market = groups.add_parser("market-data", help="sync completed daily sessions")
@@ -742,7 +755,7 @@ def _classify(error: Exception) -> tuple[ExitCode, str]:
     if isinstance(error, DatabaseConfigurationError):
         return ExitCode.CONFIGURATION, str(error)
     if isinstance(
-        error, FuturesTradingSessionInProgressError | FuturesProductEconomicsNotFoundError
+        error, FuturesTradingSessionInProgressError | FuturesContractEconomicsNotFoundError
     ):
         return ExitCode.DATA, str(error)
     if isinstance(error, _STATE_ERRORS):

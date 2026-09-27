@@ -26,13 +26,14 @@ docker run --rm caddy:2-alpine caddy hash-password   # value for NORTHSTAR_BASIC
 docker compose build
 ```
 
-Set the product economics once. The point value is yours to supply; nothing
-here assumes one.
+Set the contract economics once for each dated contract you trade, before its
+first fill is valued. The point value is yours to supply and belongs to that
+expiration only; nothing here assumes one or copies it from another expiration.
 
 ```sh
 docker compose run --rm operations northstar economics set \
   --database /data/northstar.sqlite3 --product ES --exchange CME \
-  --point-value <currency per point> --currency USD
+  --expiration <YYYY-MM-DD> --point-value <currency per point> --currency USD
 ```
 
 Bootstrap enough completed history for the strategy warm-up (at least twenty

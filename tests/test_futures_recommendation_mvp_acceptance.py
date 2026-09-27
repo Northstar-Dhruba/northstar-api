@@ -247,7 +247,8 @@ def mvp(tmp_path_factory) -> SimpleNamespace:
     )  # fmt: skip
     s.economics = _cli(
         "economics", "set", "--database", str(database), "--product", "ES",
-        "--exchange", "CME", "--point-value", "50", "--currency", "USD", env={},
+        "--exchange", "CME", "--expiration", "2026-12-18",
+        "--point-value", "50", "--currency", "USD", env={},
     )  # fmt: skip
     s.requests_bootstrap = len(scheduler.requests)
 
@@ -621,7 +622,7 @@ def test_the_d2_dashboard_shows_the_fill_position_and_pnl(mvp) -> None:
     assert body["pnl"] == {
         "status": "available",
         "reason": None,
-        "missing_product": None,
+        "missing_contract": None,
         "rows": [
             {
                 "contract": {"product": "ES", "exchange": "CME", "expiration": "2026-12-18"},
