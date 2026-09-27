@@ -425,7 +425,7 @@ def test_missing_economics_is_partial_success_with_persisted_execution(tmp_path:
     assert "completed and its facts were persisted" in run.err
     log = _log(run)
     assert (
-        "WARNING execution complete; P&L unavailable because product economics are not configured"
+        "WARNING execution complete; P&L unavailable because contract economics are not configured"
     ) in log
     assert log[-1] == "INFO exit DATA (4)"
     assert scheduler.op.counts() == (2, 1, 1)

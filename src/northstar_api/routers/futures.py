@@ -16,12 +16,12 @@ from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from northstar_application.application_services import (
     ForwardResearchContractViolationError,
+    FuturesContractEconomicsContractViolationError,
     FuturesHistoricalDataContractViolationError,
     FuturesPaperDecisionSnapshot,
     FuturesPaperPortfolioStrategyConflictError,
     FuturesPaperTradingContractViolationError,
     FuturesPaperTradingSnapshot,
-    FuturesProductEconomicsContractViolationError,
     InvalidFuturesPaperFillHistoryError,
 )
 from northstar_application.ports import FuturesHistoricalMarketDataQuery
@@ -29,9 +29,9 @@ from northstar_core.foundation.value_objects import PointInTime, Timeframe
 from northstar_core.futures import FuturesContract, FuturesOHLCVBar
 from northstar_infrastructure.market_data import FuturesHistoricalStorageError
 from northstar_infrastructure.persistence import (
+    FuturesContractEconomicsStorageError,
     FuturesForwardResearchStorageError,
     FuturesPaperTradingStorageError,
-    FuturesProductEconomicsStorageError,
 )
 
 from northstar_api.runtime import DatabaseRuntime
@@ -64,14 +64,14 @@ _STORAGE_ERRORS: tuple[type[Exception], ...] = (
     FuturesHistoricalStorageError,
     FuturesForwardResearchStorageError,
     FuturesPaperTradingStorageError,
-    FuturesProductEconomicsStorageError,
+    FuturesContractEconomicsStorageError,
 )
 _PERSISTED_STATE_ERRORS: tuple[type[Exception], ...] = (
     *_STORAGE_ERRORS,
     FuturesPaperPortfolioStrategyConflictError,
     FuturesPaperTradingContractViolationError,
     ForwardResearchContractViolationError,
-    FuturesProductEconomicsContractViolationError,
+    FuturesContractEconomicsContractViolationError,
     FuturesHistoricalDataContractViolationError,
     InvalidFuturesPaperFillHistoryError,
 )
@@ -234,12 +234,12 @@ def _portfolio(settings: DashboardSettings, snapshot: FuturesPaperTradingSnapsho
 
 def _pnl(snapshot: FuturesPaperTradingSnapshot | None) -> PnlResponse:
     if snapshot is None:
-        return PnlResponse(status="unavailable", reason=_NO_SESSION, missing_product=None, rows=())
+        return PnlResponse(status="unavailable", reason=_NO_SESSION, missing_contract=None, rows=())
     if snapshot.valuation is None:
         return PnlResponse(
             status="unavailable",
-            reason="product economics not configured",
-            missing_product=str(snapshot.missing_economics),
+            reason="contract economics not configured",
+            missing_contract=_contract(snapshot.missing_economics),
             rows=(),
         )
     rows = []
@@ -259,7 +259,7 @@ def _pnl(snapshot: FuturesPaperTradingSnapshot | None) -> PnlResponse:
                 ),
             )
         )
-    return PnlResponse(status="available", reason=None, missing_product=None, rows=tuple(rows))
+    return PnlResponse(status="available", reason=None, missing_contract=None, rows=tuple(rows))
 
 
 def _recent(snapshot: FuturesPaperTradingSnapshot | None) -> tuple[RecentDecisionResponse, ...]:
@@ -309,7 +309,7 @@ def health(request: Request):
     if dashboard is None:
         return unavailable
     try:
-        dashboard.runtime.economics_repository.get_economics(dashboard.settings.contract.product)
+        dashboard.runtime.economics_repository.get_economics(dashboard.settings.contract)
     except _STORAGE_ERRORS:
         return unavailable
     return HealthResponse(status="ok")

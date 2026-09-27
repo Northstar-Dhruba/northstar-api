@@ -19,8 +19,9 @@ sessions S0.. from 2026-06-01:
     S27 (F2)  the SELL 2 fills at its OPEN; SELL again -> target already met
     S28       unchanged; HOLD
 
-Economics are explicit test fixtures (50 USD and 10 EUR per point per
-contract), not exchange metadata. All P&L is gross simulated P&L.
+Economics are explicit per-contract test fixtures (50 USD and 10 EUR per point
+per contract, each for its Dec 2026 expiration), not exchange metadata. All P&L
+is gross simulated P&L.
 """
 
 from __future__ import annotations
@@ -70,7 +71,7 @@ _TABLES = {
     "futures_forward_research_records",
     "futures_paper_orders",
     "futures_paper_fills",
-    "futures_product_economics",
+    "futures_contract_economics",
 }
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
@@ -244,17 +245,25 @@ class Operator:
         return outcome
 
     def economics(
-        self, point_value: str = "50", currency: str = "USD", product: str = "ES", exchange="CME"
+        self,
+        point_value: str = "50",
+        currency: str = "USD",
+        product: str = "ES",
+        exchange="CME",
+        expiration: str = "2026-12-18",
     ) -> Outcome:
         return self.cli(
             "economics", "set", "--database", str(self.database), "--product", product,
-            "--exchange", exchange, "--point-value", point_value, "--currency", currency,
+            "--exchange", exchange, "--expiration", expiration,
+            "--point-value", point_value, "--currency", currency,
         )  # fmt: skip
 
-    def show(self, product: str = "ES", exchange: str = "CME") -> Outcome:
+    def show(
+        self, product: str = "ES", exchange: str = "CME", expiration: str = "2026-12-18"
+    ) -> Outcome:
         return self.cli(
             "economics", "show", "--database", str(self.database),
-            "--product", product, "--exchange", exchange,
+            "--product", product, "--exchange", exchange, "--expiration", expiration,
         )  # fmt: skip
 
     def sync(self, first: int, last: int, *, now: datetime | None = None, env=None) -> Outcome:
@@ -344,9 +353,9 @@ def day(tmp_path_factory) -> SimpleNamespace:
     s.economics_set = op.economics()
     s.economics_show = op.show()
     s.economics_retry = op.economics("50.0")
-    s.economics_rows = op.query("SELECT * FROM futures_product_economics")
+    s.economics_rows = op.query("SELECT * FROM futures_contract_economics")
     s.economics_conflict = op.economics("25")
-    s.economics_rows_after = op.query("SELECT * FROM futures_product_economics")
+    s.economics_rows_after = op.query("SELECT * FROM futures_contract_economics")
 
     s.sync_history = op.sync(0, 24)
     s.run_d1 = op.run(_close(24))
@@ -410,18 +419,20 @@ def test_economics_are_set_shown_retried_and_immutable(day) -> None:
     assert day.economics_set.code == 0
     assert day.economics_set.lines[:3] == [
         "ECONOMICS: READY",
-        "Product: ES@CME",
+        "Contract: ES@CME 2026-12-18",
         "Point value: 50 USD / quote-point / contract",
     ]
     assert day.economics_show.code == 0
     assert day.economics_show.lines == [
-        "Product: ES@CME",
+        "Contract: ES@CME 2026-12-18",
         "Point value: 50 USD / quote-point / contract",
     ]
     assert day.economics_retry.code == 0
     assert day.economics_conflict.code == ExitCode.STATE
-    assert "FuturesProductEconomicsConflictError" in day.economics_conflict.err
-    assert day.economics_rows == day.economics_rows_after == [("ES", "CME", "50", "USD")]
+    assert "FuturesContractEconomicsConflictError" in day.economics_conflict.err
+    assert (
+        day.economics_rows == day.economics_rows_after == [("ES", "CME", "2026-12-18", "50", "USD")]
+    )
 
 
 def test_history_syncs_through_the_production_acquisition_stack(day) -> None:
@@ -629,7 +640,7 @@ def test_missing_economics_never_hides_persisted_execution(tmp_path: Path) -> No
     assert filled.code == ExitCode.DATA
     assert filled.lines[0] == "PAPER SESSION: COMPLETED"
     assert _section(filled, "P&L (gross simulated)")[0] == "P&L: unavailable"
-    assert "product economics not configured" in filled.out
+    assert "contract economics not configured for ES@CME 2026-12-18" in filled.out
     assert "completed and its facts were persisted" in filled.err
     assert op.counts() == (2, 1, 1)
 
@@ -775,22 +786,42 @@ def test_corrupt_economics_are_a_state_error(tmp_path: Path) -> None:
     op = _operator(tmp_path, "corrupt")
     op.economics()
     with sqlite3.connect(op.database) as connection:
-        connection.execute("UPDATE futures_product_economics SET point_value_amount = '0'")
+        connection.execute("UPDATE futures_contract_economics SET point_value_amount = '0'")
 
     outcome = op.show()
 
     assert outcome.code == ExitCode.STATE
-    assert outcome.err.startswith("STATE ERROR: FuturesProductEconomicsStorageError")
-    assert op.query("SELECT point_value_amount FROM futures_product_economics") == [("0",)]
+    assert outcome.err.startswith("STATE ERROR: FuturesContractEconomicsStorageError")
+    assert op.query("SELECT point_value_amount FROM futures_contract_economics") == [("0",)]
     _assert_clean(outcome)
 
 
-def test_economics_show_for_an_unconfigured_product_is_data(tmp_path: Path) -> None:
+def test_economics_show_for_an_unconfigured_contract_is_data(tmp_path: Path) -> None:
     outcome = _operator(tmp_path, "unconfigured").show("NQ")
 
     assert outcome.code == ExitCode.DATA
-    assert "Product economics not configured for NQ@CME." in outcome.err
+    assert "Contract economics not configured for NQ@CME 2026-12-18." in outcome.err
     _assert_clean(outcome)
+
+
+def test_economics_for_another_expiry_do_not_configure_the_traded_contract(
+    tmp_path: Path,
+) -> None:
+    op = _operator(tmp_path, "other-expiry")
+    op.sync(0, 25)
+    op.economics(expiration="2027-03-19")
+    op.run(_close(24))
+
+    filled = op.run(_close(25))
+    march = op.show(expiration="2027-03-19")
+
+    assert filled.code == ExitCode.DATA
+    assert "contract economics not configured for ES@CME 2026-12-18" in filled.out
+    assert march.code == 0
+    assert op.query("SELECT * FROM futures_contract_economics") == [
+        ("ES", "CME", "2027-03-19", "50", "USD")
+    ]
+    _assert_clean(filled)
 
 
 def test_an_unexpected_failure_is_a_concise_internal_error(tmp_path: Path) -> None:
@@ -826,16 +857,20 @@ def test_an_unexpected_failure_is_a_concise_internal_error(tmp_path: Path) -> No
         ["paper", "run", "--product", "ES", "--exchange", "CME", "--expiration", "2026-12-18",
          "--strategy", "alpha", "--portfolio", "p", "--target", "0",
          "--as-of", "2026-07-06T22:00:00Z"],
+        ["economics", "set", "--product", "ES", "--exchange", "CME", "--expiration",
+         "2026-12-18", "--point-value", "50", "--currency", "U$D"],
+        ["economics", "set", "--product", "ES", "--exchange", "CME", "--expiration",
+         "2026-12-18", "--point-value", "0", "--currency", "USD"],
         ["economics", "set", "--product", "ES", "--exchange", "CME", "--point-value", "50",
-         "--currency", "U$D"],
-        ["economics", "set", "--product", "ES", "--exchange", "CME", "--point-value", "0",
          "--currency", "USD"],
+        ["economics", "show", "--product", "ES", "--exchange", "CME"],
         ["market-data", "sync", "--product", "ES", "--exchange", "CME",
          "--expiration", "2026-12-18", "--start", "2026-6-1", "--end", "2026-06-30"],
         ["paper", "status", "--strategy", "alpha", "--portfolio", "p"],
     ],
     ids=["naive-as-of", "bad-expiration", "zero-target", "bad-currency", "zero-point-value",
-         "malformed-date", "missing-as-of"],
+         "set-without-expiration", "show-without-expiration", "malformed-date",
+         "missing-as-of"],
 )  # fmt: skip
 def test_invalid_input_is_rejected_before_the_database(tmp_path: Path, argv) -> None:
     database = tmp_path / "never.sqlite3"
@@ -878,9 +913,10 @@ def test_paper_and_economics_commands_never_read_the_secret(tmp_path: Path) -> N
     env = Watching({"DATABENTO_API_KEY": _SECRET})
     for argv in (
         ["economics", "set", "--database", str(op.database), "--product", "ES",
-         "--exchange", "CME", "--point-value", "50", "--currency", "USD"],
+         "--exchange", "CME", "--expiration", "2026-12-18", "--point-value", "50",
+         "--currency", "USD"],
         ["economics", "show", "--database", str(op.database), "--product", "ES",
-         "--exchange", "CME"],
+         "--exchange", "CME", "--expiration", "2026-12-18"],
         ["paper", "run", "--database", str(op.database), "--product", "ES", "--exchange", "CME",
          "--expiration", "2026-12-18", "--strategy", "alpha", "--portfolio",
          "futures-paper-alpha", "--target", "1", "--as-of", _close(24)],
@@ -898,7 +934,9 @@ def test_paper_and_economics_commands_never_read_the_secret(tmp_path: Path) -> N
         (["--help"], ["economics", "market-data", "paper"]),
         (["economics", "--help"], ["set", "show"]),
         (["economics", "set", "--help"], ["--database", "--product", "--exchange",
-                                          "--point-value", "--currency"]),
+                                          "--expiration", "--point-value", "--currency"]),
+        (["economics", "show", "--help"], ["--database", "--product", "--exchange",
+                                           "--expiration"]),
         (["market-data", "sync", "--help"], ["--database", "--product", "--exchange",
                                              "--expiration", "--start", "--end"]),
         (["paper", "run", "--help"], ["--database", "--product", "--exchange", "--expiration",

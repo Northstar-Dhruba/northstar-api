@@ -143,12 +143,38 @@ def _phase_a(database: Path, sessions: int = 25) -> None:
     _store_bars(database, *(_bar(n, close) for n, close in enumerate(_RISE[:sessions], start=1)))
 
 
-def _set_economics(database: Path, point_value: str = "50", currency: str = "USD") -> Outcome:
+def _set_economics(
+    database: Path,
+    point_value: str = "50",
+    currency: str = "USD",
+    *,
+    product: str = "ES",
+    exchange: str = "CME",
+    expiration: str = "2026-12-18",
+) -> Outcome:
     return _cli(
         [
-            "economics", "set", "--database", str(database), "--product", "ES",
-            "--exchange", "CME", "--point-value", point_value, "--currency", currency,
+            "economics", "set", "--database", str(database), "--product", product,
+            "--exchange", exchange, "--expiration", expiration,
+            "--point-value", point_value, "--currency", currency,
         ]
+    )  # fmt: skip
+
+
+def _show_economics(
+    database: Path,
+    *,
+    product: str = "ES",
+    exchange: str = "CME",
+    expiration: str = "2026-12-18",
+    env: dict | None = None,
+) -> Outcome:
+    return _cli(
+        [
+            "economics", "show", "--database", str(database), "--product", product,
+            "--exchange", exchange, "--expiration", expiration,
+        ],
+        env=env,
     )  # fmt: skip
 
 
@@ -189,8 +215,14 @@ def test_top_level_help_lists_the_three_groups() -> None:
 @pytest.mark.parametrize(
     ("argv", "expected"),
     [
-        (["economics", "set", "--help"], ["--database", "--point-value", "--currency"]),
-        (["economics", "show", "--help"], ["--database", "--product", "--exchange"]),
+        (
+            ["economics", "set", "--help"],
+            ["--database", "--expiration", "--point-value", "--currency"],
+        ),
+        (
+            ["economics", "show", "--help"],
+            ["--database", "--product", "--exchange", "--expiration"],
+        ),
         (["market-data", "sync", "--help"], ["--expiration", "--start", "--end"]),
         (["paper", "run", "--help"], ["--target", "--as-of", "--strategy", "--portfolio"]),
         (["paper", "status", "--help"], ["--as-of", "--strategy", "--portfolio"]),
@@ -241,21 +273,68 @@ def test_the_fastapi_app_does_not_load_the_cli() -> None:
 
 def test_economics_set_then_show(database: Path) -> None:
     stored = _set_economics(database)
-    shown = _cli(
-        ["economics", "show", "--database", str(database), "--product", "ES", "--exchange", "CME"]
-    )
+    shown = _show_economics(database)
 
     assert stored.code == shown.code == 0
     assert stored.out.splitlines()[:3] == [
         "ECONOMICS: READY",
-        "Product: ES@CME",
+        "Contract: ES@CME 2026-12-18",
         "Point value: 50 USD / quote-point / contract",
     ]
     assert shown.out.splitlines() == [
-        "Product: ES@CME",
+        "Contract: ES@CME 2026-12-18",
         "Point value: 50 USD / quote-point / contract",
     ]
     assert stored.err == shown.err == ""
+
+
+@pytest.mark.parametrize("command", ["set", "show"])
+def test_economics_require_an_explicit_expiration(database: Path, command: str) -> None:
+    argv = ["economics", command, "--database", str(database), "--product", "ES"]
+    argv += ["--exchange", "CME"]
+    if command == "set":
+        argv += ["--point-value", "50", "--currency", "USD"]
+
+    outcome = _cli(argv)
+
+    assert outcome.code == ExitCode.INPUT
+    assert "--expiration" in outcome.err
+    assert not database.exists()
+
+
+def test_two_nifty_expiries_keep_their_own_point_values(database: Path) -> None:
+    november = _set_economics(
+        database, "75", "INR", product="NIFTY", exchange="NSE", expiration="2025-11-25"
+    )
+    january = _set_economics(
+        database, "65", "INR", product="NIFTY", exchange="NSE", expiration="2026-01-27"
+    )
+    es = _set_economics(database)
+
+    assert (november.code, january.code, es.code) == (0, 0, 0)
+    assert _show_economics(
+        database, product="NIFTY", exchange="NSE", expiration="2025-11-25"
+    ).out.splitlines() == [
+        "Contract: NIFTY@NSE 2025-11-25",
+        "Point value: 75 INR / quote-point / contract",
+    ]
+    assert _show_economics(
+        database, product="NIFTY", exchange="NSE", expiration="2026-01-27"
+    ).out.splitlines() == [
+        "Contract: NIFTY@NSE 2026-01-27",
+        "Point value: 65 INR / quote-point / contract",
+    ]
+    assert "50 USD" in _show_economics(database).out
+
+
+def test_one_expirys_economics_never_answer_for_another(database: Path) -> None:
+    _set_economics(database, "65", "INR", product="NIFTY", exchange="NSE", expiration="2026-10-27")
+
+    outcome = _show_economics(database, product="NIFTY", exchange="NSE", expiration="2026-11-23")
+
+    assert outcome.code == ExitCode.DATA
+    assert "Contract economics not configured for NIFTY@NSE 2026-11-23" in outcome.err
+    assert outcome.out == ""
 
 
 def test_an_equal_economics_retry_succeeds_and_a_change_conflicts(database: Path) -> None:
@@ -266,23 +345,10 @@ def test_an_equal_economics_retry_succeeds_and_a_change_conflicts(database: Path
 
     assert retry.code == 0
     assert conflict.code == ExitCode.STATE
-    assert "STATE ERROR: FuturesProductEconomicsConflictError" in conflict.err
+    assert "STATE ERROR: FuturesContractEconomicsConflictError" in conflict.err
+    assert "ES@CME 2026-12-18" in conflict.err
     assert conflict.out == ""
-    assert (
-        "50 USD"
-        in _cli(
-            [
-                "economics",
-                "show",
-                "--database",
-                str(database),
-                "--product",
-                "ES",
-                "--exchange",
-                "CME",
-            ]
-        ).out
-    )
+    assert "50 USD" in _show_economics(database).out
 
 
 def test_high_precision_point_values_are_kept_exactly(database: Path) -> None:
@@ -294,12 +360,10 @@ def test_high_precision_point_values_are_kept_exactly(database: Path) -> None:
 
 
 def test_missing_economics_is_a_data_error(database: Path) -> None:
-    outcome = _cli(
-        ["economics", "show", "--database", str(database), "--product", "NQ", "--exchange", "CME"]
-    )
+    outcome = _show_economics(database, product="NQ")
 
     assert outcome.code == ExitCode.DATA
-    assert "Product economics not configured for NQ@CME" in outcome.err
+    assert "Contract economics not configured for NQ@CME 2026-12-18" in outcome.err
     assert outcome.out == ""
 
 
@@ -488,8 +552,8 @@ def test_missing_economics_keeps_the_completed_session_visible(database: Path) -
     assert "  State: FILLED" in outcome.out
     assert "LONG 1 @ 7650" in outcome.out
     assert "P&L: unavailable" in outcome.out
-    assert "product economics not configured" in outcome.out
-    assert "ES@CME" in outcome.out.split("P&L: unavailable")[1]
+    assert "contract economics not configured for ES@CME 2026-12-18" in outcome.out
+    assert "ES@CME 2026-12-18" in outcome.out.split("P&L: unavailable")[1]
     assert "completed and its facts were persisted" in outcome.err
     _assert_clean(outcome)
 
@@ -662,9 +726,9 @@ def test_status_without_economics_still_shows_the_portfolio(database: Path) -> N
     assert outcome.code == ExitCode.DATA
     assert "LONG 1 @ 7650" in outcome.out
     assert "P&L: unavailable" in outcome.out
-    assert "Reason: product economics not configured for ES@CME" in outcome.out
+    assert "Reason: contract economics not configured for ES@CME 2026-12-18" in outcome.out
     assert outcome.err == (
-        "DATA ERROR: P&L unavailable because product economics are not configured.\n"
+        "DATA ERROR: P&L unavailable because contract economics are not configured.\n"
     )
 
 
@@ -866,10 +930,7 @@ def test_only_market_data_sync_reads_the_secret(database: Path) -> None:
         _paper_run(database, _at(25), env=env),
         _paper_status(database, _at(25), env=env),
     ]
-    _cli(
-        ["economics", "show", "--database", str(database), "--product", "ES", "--exchange", "CME"],
-        env=env,
-    )
+    _show_economics(database, env=env)
     assert env.read == []
 
     synced, _ = _sync(database, lambda q: FuturesDailyAcquisitionResult(q, 1, 1), env=env)

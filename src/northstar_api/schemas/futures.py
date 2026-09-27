@@ -122,11 +122,16 @@ class PnlRowResponse(BaseModel):
 
 
 class PnlResponse(BaseModel):
-    """Gross simulated P&L per contract; each amount in its own currency."""
+    """Gross simulated P&L per contract; each amount in its own currency.
+
+    ``missing_contract`` names the one dated contract -- product, exchange and
+    expiration -- whose economics are not configured; other expiries of its
+    product may well be configured.
+    """
 
     status: Availability
     reason: str | None
-    missing_product: str | None
+    missing_contract: FuturesContractResponse | None
     rows: tuple[PnlRowResponse, ...]
 
 
