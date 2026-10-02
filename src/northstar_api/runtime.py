@@ -17,16 +17,33 @@ Both use cases accept the same explicit FuturesDailyHistoricalAcquisitionQuery
 and return the same FuturesDailyAcquisitionResult, which is all a caller needs.
 FuturesDailyAcquisition names that shared shape structurally, here in the
 composition root only; it is not an Application abstraction.
+
+Pre-expiry flatten guard
+------------------------
+One DatabaseRuntime serves every contract in its database, and a contract's
+venue is known only when a command supplies it. The paper session is therefore
+chosen per contract, by ``contract.product.exchange_code``, through
+``DatabaseRuntime.paper_session_for``:
+
+    NSE          paper session guarded by the NSE calendar, K = 5
+    every other  the unguarded paper session, exactly as before
+
+The venue decides, never the market-data provider or whichever credential is
+present: where data comes from says nothing about where the contract trades.
+K is a fixed composition constant rather than configuration, because a run
+replays every frozen decision under its deterministic order identity, and a K
+that differed between runs could change a past decision's intent.
 """
 
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from types import MappingProxyType
 from typing import Protocol
 
 from northstar_application.application_services import (
@@ -35,6 +52,8 @@ from northstar_application.application_services import (
     AggregateFuturesDailySessionBarUseCase,
     BuildFuturesPaperTradingValuationUseCase,
     FuturesDailyAcquisitionResult,
+    FuturesExpiryFlattenGuard,
+    FuturesExpiryFlattenPolicy,
     GetFuturesPaperTradingSnapshotUseCase,
     RunFuturesPaperTradingSessionUseCase,
 )
@@ -47,6 +66,7 @@ from northstar_application.ports import (
     FuturesPaperFillRepository,
     FuturesPaperOrderRepository,
 )
+from northstar_core.futures import FuturesContract
 from northstar_infrastructure.market_data import (
     DatabentoFuturesHistoricalMarketDataSource,
     ExchangeCalendarFuturesTradingSessionResolver,
@@ -71,6 +91,25 @@ from northstar_infrastructure.persistence import (
     initialize_futures_paper_trading_schema,
 )
 
+# The accepted Indian MVP policy: flat by the OPEN of the session five trading
+# sessions before expiry, so the flatten is decided at the E-6 close.
+NSE_EXPIRY_FLATTEN_SESSIONS = 5
+
+
+def _nse_expiry_guard() -> FuturesExpiryFlattenGuard:
+    return FuturesExpiryFlattenGuard(
+        NSEFuturesTradingSessionResolver(),
+        FuturesExpiryFlattenPolicy(NSE_EXPIRY_FLATTEN_SESSIONS),
+    )
+
+
+# Venue -> the guard its paper session is composed with. A venue absent here
+# keeps the unguarded paper session; no other venue borrows the NSE calendar,
+# which in any case refuses every venue but NSE.
+_EXPIRY_GUARDS: dict[str, Callable[[], FuturesExpiryFlattenGuard]] = {
+    "NSE": _nse_expiry_guard,
+}
+
 
 class DatabaseConfigurationError(RuntimeError):
     """Raised when the configured SQLite database cannot be opened or initialized."""
@@ -86,7 +125,12 @@ class FuturesDailyAcquisition(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class DatabaseRuntime:
-    """Every database-backed port and use case the operational commands need."""
+    """Every database-backed port and use case the operational commands need.
+
+    ``paper_session`` is the unguarded session. ``expiry_guarded_paper_sessions``
+    maps a venue to the session composed with that venue's pre-expiry guard;
+    commands obtain the right one for a contract from ``paper_session_for``.
+    """
 
     economics_store: FuturesContractEconomicsStore
     economics_repository: FuturesContractEconomicsRepository
@@ -97,6 +141,20 @@ class DatabaseRuntime:
     paper_session: RunFuturesPaperTradingSessionUseCase
     valuation: BuildFuturesPaperTradingValuationUseCase
     snapshot: GetFuturesPaperTradingSnapshotUseCase
+    expiry_guarded_paper_sessions: Mapping[str, RunFuturesPaperTradingSessionUseCase] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+
+    def paper_session_for(self, contract: FuturesContract) -> RunFuturesPaperTradingSessionUseCase:
+        """Return the paper session for this contract's venue.
+
+        Only the contract's own exchange is consulted. A venue without a guard
+        gets ``paper_session`` itself, unchanged.
+        """
+        if not isinstance(contract, FuturesContract):
+            raise TypeError("DatabaseRuntime contract must be a FuturesContract.")
+        venue = contract.product.exchange_code.value
+        return self.expiry_guarded_paper_sessions.get(venue, self.paper_session)
 
 
 def initialize_database(path: Path) -> None:
@@ -128,14 +186,12 @@ def build_database_runtime(path: Path) -> DatabaseRuntime:
     orders = SQLiteFuturesPaperOrderRepository(path)
     fills = SQLiteFuturesPaperFillRepository(path)
     economics = SQLiteFuturesContractEconomicsRepository(path)
-    return DatabaseRuntime(
-        economics_store=SQLiteFuturesContractEconomicsStore(path),
-        economics_repository=economics,
-        market_repository=market,
-        forward_repository=forward,
-        order_repository=orders,
-        fill_repository=fills,
-        paper_session=RunFuturesPaperTradingSessionUseCase(
+
+    def paper_session(
+        expiry_guard: FuturesExpiryFlattenGuard | None = None,
+    ) -> RunFuturesPaperTradingSessionUseCase:
+        # Guarded or not, every session works over the same SQLite ports.
+        return RunFuturesPaperTradingSessionUseCase(
             market_repository=market,
             forward_store=SQLiteFuturesForwardResearchRecordStore(path),
             forward_repository=forward,
@@ -143,7 +199,17 @@ def build_database_runtime(path: Path) -> DatabaseRuntime:
             order_repository=orders,
             fill_store=SQLiteFuturesPaperFillStore(path),
             fill_repository=fills,
-        ),
+            expiry_guard=expiry_guard,
+        )
+
+    return DatabaseRuntime(
+        economics_store=SQLiteFuturesContractEconomicsStore(path),
+        economics_repository=economics,
+        market_repository=market,
+        forward_repository=forward,
+        order_repository=orders,
+        fill_repository=fills,
+        paper_session=paper_session(),
         valuation=BuildFuturesPaperTradingValuationUseCase(
             order_repository=orders,
             fill_repository=fills,
@@ -156,6 +222,9 @@ def build_database_runtime(path: Path) -> DatabaseRuntime:
             order_repository=orders,
             fill_repository=fills,
             economics_repository=economics,
+        ),
+        expiry_guarded_paper_sessions=MappingProxyType(
+            {venue: paper_session(guard()) for venue, guard in _EXPIRY_GUARDS.items()}
         ),
     )
 

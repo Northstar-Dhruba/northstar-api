@@ -24,8 +24,9 @@ Exit codes:
     1  INTERNAL       unexpected failure
     2  INPUT          an argument could not be parsed or validated
     3  CONFIGURATION  missing API key or settings, or a database that cannot be opened
-    4  DATA           a session not yet complete, no persisted history to extend, or
-                      contract economics not configured; for ``paper run`` and
+    4  DATA           a session not yet complete, no persisted history to extend,
+                      a contract whose expiry window the session calendar cannot
+                      place, or contract economics not configured; for ``paper run`` and
                       ``operations daily`` this means the paper session completed
                       and was persisted but P&L was unavailable
     5  STATE          an immutable conflict, a mixed-strategy portfolio, a
@@ -56,6 +57,7 @@ from northstar_application.application_services import (
     FuturesContractEconomicsNotFoundError,
     FuturesDailyAcquisitionResult,
     FuturesDailySessionCoverageError,
+    FuturesExpiryWindowError,
     FuturesHistoricalDataContractViolationError,
     FuturesPaperPortfolioStrategyConflictError,
     FuturesPaperTradingContractViolationError,
@@ -472,7 +474,10 @@ def _run_paper_session(
     _refuse_backward_run(runtime, contract, strategy, as_of)
     context.warn(_TARGET_WARNING)
 
-    session = runtime.paper_session.execute(contract, strategy, portfolio, target, as_of)
+    # The contract's own venue selects the session, and with it any pre-expiry guard.
+    session = runtime.paper_session_for(contract).execute(
+        contract, strategy, portfolio, target, as_of
+    )
     context.write(
         [
             "PAPER SESSION: COMPLETED",
@@ -847,6 +852,9 @@ def _classify(error: Exception) -> tuple[ExitCode, str]:
         error, FuturesTradingSessionInProgressError | FuturesContractEconomicsNotFoundError
     ):
         return ExitCode.DATA, str(error)
+    if isinstance(error, FuturesExpiryWindowError):
+        # The contract and the session calendar disagree; a data fact, not a crash.
+        return ExitCode.DATA, f"{type(error).__name__}: {error}"
     if isinstance(error, _STATE_ERRORS):
         return ExitCode.STATE, f"{type(error).__name__}: {error}"
     if isinstance(error, _PROVIDER_ERRORS):
