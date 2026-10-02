@@ -87,6 +87,9 @@ def _execution_lines(result: FuturesPaperTradingDecisionResult) -> list[str]:
         f"Contracts: {intent.contracts.value}",
         f"ID: {result.order.identity.identity}",
     ]
+    if result.decision.expiry_flatten:
+        # Closes the position before the protected pre-expiry window, whatever the action.
+        lines.insert(3, "Expiry flatten: yes")
     if result.fill is not None:
         lines += [
             f"Simulated fill price: {result.fill.fill_quote.value}",
