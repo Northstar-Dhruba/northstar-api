@@ -8,6 +8,10 @@ serves; the daily operation does not.
 DATABENTO_API_KEY is deliberately not among them: the dashboard never acquires
 market data, and the daily operation reads the secret separately at its command
 boundary.
+
+NORTHSTAR_FUTURES_MARKET_DATA_PROVIDER names the futures market-data provider
+the daily operation acquires from. It is read on its own, only by the daily
+operation, and is never inferred from which credential happens to be present.
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 
 from northstar_core.derivatives import ExpirationDate
@@ -37,12 +42,42 @@ VARIABLES = (
     "NORTHSTAR_WEB_ORIGIN",
     *OPERATION_VARIABLES[1:],
 )
+MARKET_DATA_PROVIDER_VARIABLE = "NORTHSTAR_FUTURES_MARKET_DATA_PROVIDER"
 _ORIGIN = re.compile(r"https?://[^/\s]+")
 _COUNT = re.compile(r"[1-9][0-9]*")
 
 
 class DashboardSettingsError(ValueError):
     """Raised when the futures environment is incomplete or invalid."""
+
+
+class FuturesMarketDataProvider(StrEnum):
+    """The futures market-data providers runtime composition can select between.
+
+    Each takes a different Application acquisition path: Databento supplies
+    minute bars folded into daily session bars, Upstox supplies native daily
+    candles. Which path a provider uses is decided in the runtime, never here.
+    """
+
+    DATABENTO = "databento"
+    UPSTOX = "upstox"
+
+
+def parse_market_data_provider(text: str) -> FuturesMarketDataProvider:
+    """Return the named provider, or raise ValueError naming the supported ones."""
+    try:
+        return FuturesMarketDataProvider(text.strip().lower())
+    except ValueError:
+        supported = ", ".join(provider.value for provider in FuturesMarketDataProvider)
+        raise ValueError(f"must be one of {supported}; got {text!r}") from None
+
+
+def load_market_data_provider(env: Mapping[str, str]) -> FuturesMarketDataProvider:
+    """Return the configured provider; unset or blank keeps the established Databento path."""
+    text = env.get(MARKET_DATA_PROVIDER_VARIABLE, "").strip()
+    if not text:
+        return FuturesMarketDataProvider.DATABENTO
+    return _value(MARKET_DATA_PROVIDER_VARIABLE, text, parse_market_data_provider)
 
 
 @dataclass(frozen=True, slots=True)
