@@ -4,6 +4,19 @@ This is a composition root: it is the only place that chooses concrete
 Infrastructure adapters for the futures paper-trading use cases. Every adapter
 works against one explicitly supplied SQLite file; nothing is cached between
 invocations, so a fresh process reconstructs everything from that file.
+
+Futures market-data providers
+-----------------------------
+Each provider is composed onto its own Application acquisition path, and the
+two are deliberately not merged behind one source port:
+
+    Databento  minute bars -> CME exchange calendar -> fold into daily bars
+    Upstox     native daily candles -> NSE calendar -> stamp at session close
+
+Both use cases accept the same explicit FuturesDailyHistoricalAcquisitionQuery
+and return the same FuturesDailyAcquisitionResult, which is all a caller needs.
+FuturesDailyAcquisition names that shared shape structurally, here in the
+composition root only; it is not an Application abstraction.
 """
 
 from __future__ import annotations
@@ -14,17 +27,21 @@ from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Protocol
 
 from northstar_application.application_services import (
     AcquireFuturesDailyHistoryUseCase,
+    AcquireFuturesNativeDailyHistoryUseCase,
     AggregateFuturesDailySessionBarUseCase,
     BuildFuturesPaperTradingValuationUseCase,
+    FuturesDailyAcquisitionResult,
     GetFuturesPaperTradingSnapshotUseCase,
     RunFuturesPaperTradingSessionUseCase,
 )
 from northstar_application.ports import (
     FuturesContractEconomicsRepository,
     FuturesContractEconomicsStore,
+    FuturesDailyHistoricalAcquisitionQuery,
     FuturesForwardResearchRecordRepository,
     FuturesHistoricalMarketDataRepository,
     FuturesPaperFillRepository,
@@ -33,10 +50,13 @@ from northstar_application.ports import (
 from northstar_infrastructure.market_data import (
     DatabentoFuturesHistoricalMarketDataSource,
     ExchangeCalendarFuturesTradingSessionResolver,
+    NSEFuturesTradingSessionResolver,
     SQLiteFuturesHistoricalMarketDataRepository,
     SQLiteFuturesHistoricalMarketDataStore,
+    UpstoxFuturesNativeDailyMarketDataSource,
     initialize_futures_market_data_schema,
 )
+from northstar_infrastructure.market_data.upstox_http import UpstoxFetch
 from northstar_infrastructure.persistence import (
     SQLiteFuturesContractEconomicsRepository,
     SQLiteFuturesContractEconomicsStore,
@@ -54,6 +74,14 @@ from northstar_infrastructure.persistence import (
 
 class DatabaseConfigurationError(RuntimeError):
     """Raised when the configured SQLite database cannot be opened or initialized."""
+
+
+class FuturesDailyAcquisition(Protocol):
+    """What a market-data command needs from either provider's acquisition use case."""
+
+    def execute(
+        self, query: FuturesDailyHistoricalAcquisitionQuery
+    ) -> FuturesDailyAcquisitionResult: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,5 +177,30 @@ def build_market_sync_runtime(
         ExchangeCalendarFuturesTradingSessionResolver(),
         source,
         AggregateFuturesDailySessionBarUseCase(),
+        SQLiteFuturesHistoricalMarketDataStore(path),
+    )
+
+
+def build_upstox_market_sync_runtime(
+    path: Path, access_token: str, *, fetch: UpstoxFetch | None = None
+) -> AcquireFuturesNativeDailyHistoryUseCase:
+    """Initialize the database and wire Upstox native daily acquisition into it.
+
+    No clock is involved anywhere on this path. Unlike the Databento adapter,
+    the Upstox adapter has no completed-session guard, and none is added here:
+    whether a session's daily candle is final is not established, so the
+    caller's explicit trading-date range is the only eligibility rule.
+
+    ``fetch`` replaces the adapter's HTTP transport, for tests only.
+    """
+    initialize_database(path)
+    source = (
+        UpstoxFuturesNativeDailyMarketDataSource(access_token)
+        if fetch is None
+        else UpstoxFuturesNativeDailyMarketDataSource(access_token, fetch=fetch)
+    )
+    return AcquireFuturesNativeDailyHistoryUseCase(
+        NSEFuturesTradingSessionResolver(),
+        source,
         SQLiteFuturesHistoricalMarketDataStore(path),
     )

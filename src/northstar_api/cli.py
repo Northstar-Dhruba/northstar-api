@@ -6,9 +6,10 @@
     northstar operations daily
 
 The manual commands take every value on the command line; the only thing they
-read from the environment is the provider secret DATABENTO_API_KEY, and only
-``market-data sync`` reads it. Nothing there reads a clock: cutoffs are supplied
-by the operator.
+read from the environment is the selected provider's secret -- DATABENTO_API_KEY
+for ``--provider databento`` (the default) or UPSTOX_ANALYTICS_TOKEN for
+``--provider upstox`` -- and only ``market-data sync`` reads it. Nothing there
+reads a clock: cutoffs and trading-date ranges are supplied by the operator.
 
 ``operations daily`` is the unattended entry point. It reads its configuration
 and the secret from the environment, reads the wall clock exactly once, syncs
@@ -54,6 +55,7 @@ from northstar_application.application_services import (
     FuturesContractEconomicsContractViolationError,
     FuturesContractEconomicsNotFoundError,
     FuturesDailyAcquisitionResult,
+    FuturesDailySessionCoverageError,
     FuturesHistoricalDataContractViolationError,
     FuturesPaperPortfolioStrategyConflictError,
     FuturesPaperTradingContractViolationError,
@@ -91,6 +93,7 @@ from northstar_infrastructure.market_data import (
     ExchangeCalendarFuturesTradingSessionResolver,
     FuturesHistoricalStorageError,
     FuturesTradingSessionInProgressError,
+    UpstoxMarketDataSourceError,
 )
 from northstar_infrastructure.persistence import (
     FuturesContractEconomicsStorageError,
@@ -110,16 +113,22 @@ from northstar_api.operations import (
 from northstar_api.runtime import (
     DatabaseConfigurationError,
     DatabaseRuntime,
+    FuturesDailyAcquisition,
     build_database_runtime,
     build_market_sync_runtime,
+    build_upstox_market_sync_runtime,
 )
 from northstar_api.settings import (
+    MARKET_DATA_PROVIDER_VARIABLE,
     OPERATION_VARIABLES,
     DashboardSettingsError,
+    FuturesMarketDataProvider,
+    load_market_data_provider,
     load_operation_settings,
 )
 
 API_KEY_VARIABLE = "DATABENTO_API_KEY"
+UPSTOX_TOKEN_VARIABLE = "UPSTOX_ANALYTICS_TOKEN"
 _DAILY = Timeframe("1d")
 _DATE_TEXT = re.compile(r"\d{4}-\d{2}-\d{2}")
 _COUNT_TEXT = re.compile(r"[1-9][0-9]*")
@@ -128,6 +137,8 @@ _TARGET_WARNING = (
     "Changing it after execution facts exist may conflict with frozen orders."
 )
 _SYNC_PARTIAL = "Earlier completed sessions in the range may already have been stored."
+# Native daily acquisition validates the whole range before one atomic write.
+_SYNC_NOTHING_STORED = "Nothing from this range was stored."
 
 
 class ExitCode(IntEnum):
@@ -169,6 +180,7 @@ _STATE_ERRORS: tuple[type[Exception], ...] = (
 )
 _PROVIDER_ERRORS: tuple[type[Exception], ...] = (
     DatabentoFuturesHistoricalMarketDataSourceError,
+    UpstoxMarketDataSourceError,
     FuturesSessionResolutionError,
 )
 
@@ -194,6 +206,9 @@ class _Context:
     database_runtime: Callable[[Path], DatabaseRuntime]
     market_sync_runtime: Callable[[Path, str], AcquireFuturesDailyHistoryUseCase]
     daily_sync_runtime: DailySyncRuntime = _daily_sync_runtime
+    upstox_market_sync_runtime: Callable[[Path, str], FuturesDailyAcquisition] = (
+        build_upstox_market_sync_runtime
+    )
     clock: Clock = _utc_now
     # Secrets read by this invocation; every output line is scrubbed of them.
     secrets: list[str] = field(default_factory=list)
@@ -313,19 +328,42 @@ def _economics_show(args: argparse.Namespace, context: _Context) -> ExitCode:
 # ---------------------------------------------------------------------------
 
 
-def _api_key(context: _Context, command: str) -> str:
-    api_key = context.env.get(API_KEY_VARIABLE, "").strip()
-    if not api_key:
+def _secret(context: _Context, variable: str, provider: str, command: str) -> str:
+    """Read one provider secret, refusing a missing one; it is redacted from all output."""
+    secret = context.env.get(variable, "").strip()
+    if not secret:
         raise CommandError(
             ExitCode.CONFIGURATION,
-            f"{API_KEY_VARIABLE} is not set; {command} needs Databento credentials.",
+            f"{variable} is not set; {command} needs {provider} credentials.",
         )
-    context.secrets.append(api_key)
-    return api_key
+    context.secrets.append(secret)
+    return secret
+
+
+def _api_key(context: _Context, command: str) -> str:
+    return _secret(context, API_KEY_VARIABLE, "Databento", command)
+
+
+def _market_acquisition(
+    context: _Context, provider: FuturesMarketDataProvider, database: Path, command: str
+) -> tuple[FuturesDailyAcquisition, str]:
+    """Compose the selected provider's acquisition path and its failure note.
+
+    Only the selected provider's secret is read. The two paths are composed
+    separately because they are different Application use cases; the caller
+    sees only their shared execute(query) -> result shape.
+    """
+    if provider is FuturesMarketDataProvider.UPSTOX:
+        token = _secret(context, UPSTOX_TOKEN_VARIABLE, "Upstox", command)
+        return context.upstox_market_sync_runtime(database, token), _SYNC_NOTHING_STORED
+    api_key = _api_key(context, command)
+    return context.market_sync_runtime(database, api_key), _SYNC_PARTIAL
 
 
 def _acquire(
-    acquisition: AcquireFuturesDailyHistoryUseCase, query: FuturesDailyHistoricalAcquisitionQuery
+    acquisition: FuturesDailyAcquisition,
+    query: FuturesDailyHistoricalAcquisitionQuery,
+    stopped: str = _SYNC_PARTIAL,
 ) -> FuturesDailyAcquisitionResult:
     try:
         return acquisition.execute(query)
@@ -336,15 +374,22 @@ def _acquire(
             f"Session {error.trading_date.isoformat()} has not completed.\n"
             f"Session close: {error.session_close}\n"
             f"Current UTC: {now}\n"
-            f"Sync stopped at {error.trading_date.isoformat()}. {_SYNC_PARTIAL}",
+            f"Sync stopped at {error.trading_date.isoformat()}. {stopped}",
+        ) from error
+    except FuturesDailySessionCoverageError as error:
+        # The provider and the calendar disagree about which sessions exist in
+        # the requested range: a candle not (yet) published, a range reaching
+        # before the contract listed, or a session the calendar does not know.
+        raise CommandError(
+            ExitCode.DATA, f"{type(error).__name__}: {error}\nSync stopped. {stopped}"
         ) from error
     except (*_PROVIDER_ERRORS, FuturesHistoricalDataContractViolationError) as error:
         raise CommandError(
-            ExitCode.PROVIDER, f"{type(error).__name__}: {error}\nSync stopped. {_SYNC_PARTIAL}"
+            ExitCode.PROVIDER, f"{type(error).__name__}: {error}\nSync stopped. {stopped}"
         ) from error
     except FuturesHistoricalMarketDataConflictError as error:
         raise CommandError(
-            ExitCode.STATE, f"{type(error).__name__}: {error}\nSync stopped. {_SYNC_PARTIAL}"
+            ExitCode.STATE, f"{type(error).__name__}: {error}\nSync stopped. {stopped}"
         ) from error
 
 
@@ -357,17 +402,20 @@ def _market_data_sync(args: argparse.Namespace, context: _Context) -> ExitCode:
         f"{args.start}..{args.end}",
         lambda _: FuturesDailyHistoricalAcquisitionQuery(contract, start, end),
     )
-    api_key = _api_key(context, "market-data sync")
+    provider = FuturesMarketDataProvider(args.provider)
 
-    acquisition = context.market_sync_runtime(_database(args), api_key)
+    acquisition, stopped = _market_acquisition(
+        context, provider, _database(args), "market-data sync"
+    )
     context.write(
         [
             "MARKET DATA SYNC",
+            f"Provider: {provider.value}",
             f"Contract: {contract}",
             f"Date range: {start} .. {end} (trading dates)",
         ]
     )
-    result = _acquire(acquisition, query)
+    result = _acquire(acquisition, query, stopped)
 
     context.write(
         [
@@ -513,11 +561,37 @@ def _summary(lines: Sequence[str]) -> str:
     return "; ".join(line for line in lines if line)
 
 
+def _require_clock_compatible_provider(context: _Context) -> None:
+    """Refuse a provider whose session finality the daily operation cannot decide.
+
+    The daily operation chooses its acquisition range from the wall clock: a
+    session counts as complete once its resolved close has passed. That rule
+    is the Databento adapter's own completed-session guard. Whether an Upstox
+    daily candle is final at the session close is not established, so applying
+    the rule to Upstox would invent a finality policy. It is refused before any
+    secret or clock is read; Upstox ranges are acquired explicitly instead.
+    """
+    try:
+        provider = load_market_data_provider(context.env)
+    except DashboardSettingsError as error:
+        raise CommandError(ExitCode.CONFIGURATION, str(error)) from error
+    if provider is not FuturesMarketDataProvider.DATABENTO:
+        raise CommandError(
+            ExitCode.CONFIGURATION,
+            f"{MARKET_DATA_PROVIDER_VARIABLE}={provider.value} is not supported by "
+            "operations daily: it decides completed sessions from the wall clock, and "
+            f"{provider.value} daily-candle finality is not established. Acquire explicit "
+            f"ranges with 'northstar market-data sync --provider {provider.value} "
+            "--start ... --end ...'.",
+        )
+
+
 def _daily_operation(context: _Context, log: logging.Logger) -> FuturesDailyOperationResult:
     try:
         settings = load_operation_settings(context.env)
     except DashboardSettingsError as error:
         raise CommandError(ExitCode.CONFIGURATION, str(error)) from error
+    _require_clock_compatible_provider(context)
     api_key = _api_key(context, "operations daily")
     now = context.clock()
     captured = captured_instant(now)
@@ -688,12 +762,26 @@ def build_parser() -> argparse.ArgumentParser:
     market = groups.add_parser("market-data", help="sync completed daily sessions")
     market_commands = market.add_subparsers(dest="command", required=True)
     sync_parser = market_commands.add_parser(
-        "sync", help=f"acquire completed sessions from Databento (needs {API_KEY_VARIABLE})"
+        "sync",
+        help=(
+            f"acquire daily sessions from the selected provider (Databento needs "
+            f"{API_KEY_VARIABLE}; Upstox needs {UPSTOX_TOKEN_VARIABLE})"
+        ),
     )
     _add_database(sync_parser)
     _add_contract(sync_parser)
     sync_parser.add_argument("--start", required=True, help="first trading date, YYYY-MM-DD")
     sync_parser.add_argument("--end", required=True, help="last trading date, YYYY-MM-DD")
+    sync_parser.add_argument(
+        "--provider",
+        choices=[provider.value for provider in FuturesMarketDataProvider],
+        default=FuturesMarketDataProvider.DATABENTO.value,
+        help=(
+            "futures market-data provider (default: databento). databento acquires "
+            "completed CME sessions from minute data; upstox acquires native daily NSE "
+            "candles for exactly the dates given, with no completeness check of its own"
+        ),
+    )
     sync_parser.set_defaults(handler=_market_data_sync)
 
     paper = groups.add_parser("paper", help="run or inspect paper trading")
@@ -729,7 +817,8 @@ def build_parser() -> argparse.ArgumentParser:
             "completed.\n\n"
             "Environment:\n"
             + "".join(f"  {name}\n" for name in OPERATION_VARIABLES)
-            + f"  {API_KEY_VARIABLE}  (secret; never echoed)\n\n"
+            + f"  {API_KEY_VARIABLE}  (secret; never echoed)\n"
+            + f"  {MARKET_DATA_PROVIDER_VARIABLE}  (optional; only databento is supported)\n\n"
             "Persisted history must first be bootstrapped with 'northstar market-data sync'.\n"
             "The paper cutoff is the latest persisted daily bar, never the clock."
         ),
@@ -777,6 +866,9 @@ def main(
         [Path, str], AcquireFuturesDailyHistoryUseCase
     ] = build_market_sync_runtime,
     daily_sync_runtime: DailySyncRuntime = _daily_sync_runtime,
+    upstox_market_sync_runtime: Callable[
+        [Path, str], FuturesDailyAcquisition
+    ] = build_upstox_market_sync_runtime,
     clock: Clock = _utc_now,
 ) -> int:
     """Run one command and return its exit code."""
@@ -795,6 +887,7 @@ def main(
         database_runtime=database_runtime,
         market_sync_runtime=market_sync_runtime,
         daily_sync_runtime=daily_sync_runtime,
+        upstox_market_sync_runtime=upstox_market_sync_runtime,
         clock=clock,
     )
     try:
