@@ -3,7 +3,8 @@
 Read only from the process environment, and only here. They name one monitored
 contract, one strategy label, one paper portfolio and its fixed target. No
 setting is persisted. The dashboard additionally needs the one web origin it
-serves; the daily operation does not.
+serves; the daily operation does not. The dashboard also reads the three
+chronological-operation settings below, only to show them.
 
 DATABENTO_API_KEY is deliberately not among them: the dashboard never acquires
 market data, and the daily operation reads the secret separately at its command
@@ -178,9 +179,18 @@ class FuturesOperationSettings:
     target: FuturesContractCount
 
 
+_DISABLED_SESSION_OPERATIONS = FuturesSessionOperationSettings(
+    FuturesDailyBarFinalityMode.DISABLED, None, None
+)
+
+
 @dataclass(frozen=True, slots=True)
 class DashboardSettings:
-    """Validated configuration of the one monitored futures contract and portfolio."""
+    """Validated configuration of the one monitored futures contract and portfolio.
+
+    ``operations`` is the chronological operation's finality and go-live
+    configuration, shown read-only; it holds no secret.
+    """
 
     database: Path
     web_origin: str
@@ -188,6 +198,7 @@ class DashboardSettings:
     strategy: StrategyIdentity
     portfolio: PaperPortfolioIdentity
     target: FuturesContractCount
+    operations: FuturesSessionOperationSettings = _DISABLED_SESSION_OPERATIONS
 
 
 def _value(name: str, text: str, build):
@@ -263,4 +274,5 @@ def load_dashboard_settings(env: Mapping[str, str]) -> DashboardSettings | None:
         strategy=operation.strategy,
         portfolio=operation.portfolio,
         target=operation.target,
+        operations=load_session_operation_settings(env),
     )

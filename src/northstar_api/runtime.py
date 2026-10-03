@@ -68,6 +68,7 @@ from northstar_application.ports import (
     FuturesHistoricalMarketDataRepository,
     FuturesPaperFillRepository,
     FuturesPaperOrderRepository,
+    FuturesTradingSessionResolver,
 )
 from northstar_core.futures import FuturesContract
 from northstar_infrastructure.market_data import (
@@ -114,6 +115,25 @@ def _nse_expiry_guard() -> FuturesExpiryFlattenGuard:
 _EXPIRY_GUARDS: dict[str, Callable[[], FuturesExpiryFlattenGuard]] = {
     "NSE": _nse_expiry_guard,
 }
+
+# Venue -> the calendar its chronological daily operation plans sessions with.
+_CHRONOLOGICAL_RESOLVERS: dict[str, Callable[[], FuturesTradingSessionResolver]] = {
+    "NSE": NSEFuturesTradingSessionResolver,
+}
+
+
+def expiry_guard_for(contract: FuturesContract) -> FuturesExpiryFlattenGuard | None:
+    """Return the pre-expiry guard composed for this contract's venue, if it has one."""
+    factory = _EXPIRY_GUARDS.get(contract.product.exchange_code.value)
+    return factory() if factory is not None else None
+
+
+def chronological_session_resolver(
+    contract: FuturesContract,
+) -> FuturesTradingSessionResolver | None:
+    """Return the calendar the chronological operation plans this contract with, if any."""
+    factory = _CHRONOLOGICAL_RESOLVERS.get(contract.product.exchange_code.value)
+    return factory() if factory is not None else None
 
 
 class DatabaseConfigurationError(RuntimeError):
