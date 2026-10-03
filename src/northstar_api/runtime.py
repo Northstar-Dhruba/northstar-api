@@ -51,6 +51,7 @@ from northstar_application.application_services import (
     AcquireFuturesNativeDailyHistoryUseCase,
     AggregateFuturesDailySessionBarUseCase,
     BuildFuturesPaperTradingValuationUseCase,
+    CalculateFuturesAnalysisUseCase,
     DisabledFuturesDailyBarFinalityPolicy,
     FuturesDailyAcquisitionResult,
     FuturesExpiryFlattenGuard,
@@ -71,6 +72,7 @@ from northstar_application.ports import (
     FuturesTradingSessionResolver,
 )
 from northstar_core.futures import FuturesContract
+from northstar_core.strategy import FuturesAssetAnalysisGenerator
 from northstar_infrastructure.market_data import (
     DatabentoFuturesHistoricalMarketDataSource,
     ExchangeCalendarFuturesTradingSessionResolver,
@@ -297,6 +299,22 @@ def build_upstox_market_sync_runtime(
         NSEFuturesTradingSessionResolver(),
         source,
         SQLiteFuturesHistoricalMarketDataStore(path),
+    )
+
+
+def build_futures_analysis(runtime: DatabaseRuntime) -> CalculateFuturesAnalysisUseCase:
+    """Compose the read-only futures analysis over one database runtime's ports.
+
+    It reads through the runtime's repositories only, with the built-in
+    analysis generator the paper session uses; it holds no store.
+    """
+    return CalculateFuturesAnalysisUseCase(
+        forward_repository=runtime.forward_repository,
+        order_repository=runtime.order_repository,
+        fill_repository=runtime.fill_repository,
+        market_repository=runtime.market_repository,
+        economics_repository=runtime.economics_repository,
+        analysis_generator=FuturesAssetAnalysisGenerator(),
     )
 
 
