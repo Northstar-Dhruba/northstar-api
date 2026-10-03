@@ -654,12 +654,18 @@ def _operation_env(database: Path, **extra: str) -> dict[str, str]:
     }
 
 
-def test_operations_daily_refuses_upstox_before_any_secret_or_clock(database: Path) -> None:
+def test_operations_daily_with_upstox_fails_closed_by_default(database: Path) -> None:
+    """INDIA-8B supersedes the INDIA-4 refusal: Upstox now runs the chronological
+    operation, whose unset finality mode is disabled -- no clock, no acquisition."""
     built: list[object] = []
     env = TrackingEnv(
         _operation_env(
             database,
-            **{MARKET_DATA_PROVIDER_VARIABLE: "upstox", "UPSTOX_ANALYTICS_TOKEN": _UPSTOX_TOKEN},
+            **{
+                MARKET_DATA_PROVIDER_VARIABLE: "upstox",
+                "UPSTOX_ANALYTICS_TOKEN": _UPSTOX_TOKEN,
+                "NORTHSTAR_FUTURES_GO_LIVE": "2026-09-29",
+            },
         )
     )
 
@@ -671,13 +677,10 @@ def test_operations_daily_refuses_upstox_before_any_secret_or_clock(database: Pa
         clock=_never_called_clock,
     )
 
-    assert outcome.code == ExitCode.CONFIGURATION
-    assert f"{MARKET_DATA_PROVIDER_VARIABLE}=upstox is not supported by operations daily" in (
-        outcome.err
-    )
-    assert "market-data sync --provider upstox" in outcome.err
+    assert outcome.code == ExitCode.SUCCESS
+    assert "Finality mode: disabled" in outcome.out
+    assert "STATUS: WAITING -- Daily-bar finality is not established" in outcome.out
     assert built == []
-    assert "UPSTOX_ANALYTICS_TOKEN" not in env.read
     assert "DATABENTO_API_KEY" not in env.read
     _assert_no_secret(outcome)
 

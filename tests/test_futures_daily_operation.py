@@ -569,3 +569,31 @@ def test_dashboard_reads_during_the_daily_write_stay_consistent(tmp_path: Path) 
     with sqlite3.connect(scheduler.database) as connection:
         assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
         assert connection.execute("PRAGMA journal_mode").fetchone() == ("delete",)
+
+
+def test_cme_after_a_gap_still_decides_only_at_the_latest_session(tmp_path: Path) -> None:
+    """Frozen CME semantics, pinned by INDIA-8B and deliberately not changed by it.
+
+    After a gap the clock-decided Databento operation syncs every missing session
+    in one range but freezes a decision only at the latest one: the intermediate
+    sessions are never decided. The chronological Upstox operation differs.
+    """
+    scheduler = Scheduler(tmp_path / "latest-only.sqlite3")
+    scheduler.bootstrap(21)
+    first = scheduler.daily(_after(21))
+    for index in (22, 23, 24):
+        scheduler.provider.publish(index)
+
+    second = scheduler.daily(_after(24))
+
+    # Paper sessions complete either way; DATA only means economics are absent here.
+    assert {first.code, second.code} <= {ExitCode.SUCCESS, ExitCode.DATA}
+    decisions = [
+        row[0]
+        for row in scheduler.op.query(
+            "SELECT decision_instant FROM futures_forward_research_records"
+            " ORDER BY decision_instant"
+        )
+    ]
+    assert decisions == [_close(21), _close(24)]
+    assert scheduler.bars()[-3:] == [_close(22), _close(23), _close(24)]

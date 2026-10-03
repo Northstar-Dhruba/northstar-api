@@ -51,15 +51,18 @@ from northstar_application.application_services import (
     AcquireFuturesNativeDailyHistoryUseCase,
     AggregateFuturesDailySessionBarUseCase,
     BuildFuturesPaperTradingValuationUseCase,
+    DisabledFuturesDailyBarFinalityPolicy,
     FuturesDailyAcquisitionResult,
     FuturesExpiryFlattenGuard,
     FuturesExpiryFlattenPolicy,
     GetFuturesPaperTradingSnapshotUseCase,
+    OperatorApprovedFuturesDailyBarFinalityPolicy,
     RunFuturesPaperTradingSessionUseCase,
 )
 from northstar_application.ports import (
     FuturesContractEconomicsRepository,
     FuturesContractEconomicsStore,
+    FuturesDailyBarFinalityPolicy,
     FuturesDailyHistoricalAcquisitionQuery,
     FuturesForwardResearchRecordRepository,
     FuturesHistoricalMarketDataRepository,
@@ -90,6 +93,8 @@ from northstar_infrastructure.persistence import (
     initialize_futures_forward_research_record_schema,
     initialize_futures_paper_trading_schema,
 )
+
+from northstar_api.settings import FuturesDailyBarFinalityMode, FuturesSessionOperationSettings
 
 # The accepted Indian MVP policy: flat by the OPEN of the session five trading
 # sessions before expiry, so the flatten is decided at the E-6 close.
@@ -273,3 +278,16 @@ def build_upstox_market_sync_runtime(
         source,
         SQLiteFuturesHistoricalMarketDataStore(path),
     )
+
+
+def build_daily_bar_finality_policy(
+    settings: FuturesSessionOperationSettings,
+) -> FuturesDailyBarFinalityPolicy:
+    """Compose the configured daily-bar finality policy; disabled unless approved.
+
+    Only the two deterministic Application policies exist. Neither reads a
+    clock, and there is deliberately no automatic, time-based composition.
+    """
+    if settings.finality_mode is FuturesDailyBarFinalityMode.OPERATOR_APPROVED:
+        return OperatorApprovedFuturesDailyBarFinalityPolicy(settings.final_through)
+    return DisabledFuturesDailyBarFinalityPolicy()
