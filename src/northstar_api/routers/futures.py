@@ -37,8 +37,9 @@ from northstar_infrastructure.persistence import (
     FuturesPaperTradingStorageError,
 )
 
+from northstar_api.futures_analysis import ANALYSIS_HORIZONS, analysis_sections
 from northstar_api.operational_status import operational_status
-from northstar_api.runtime import DatabaseRuntime
+from northstar_api.runtime import DatabaseRuntime, build_futures_analysis
 from northstar_api.schemas.futures import (
     FreshnessResponse,
     FuturesContractResponse,
@@ -56,6 +57,10 @@ from northstar_api.schemas.futures import (
     RecentDecisionResponse,
     ResearchResponse,
     SelectedContractResponse,
+)
+from northstar_api.schemas.futures_analysis import (
+    AnalysisContextResponse,
+    FuturesAnalysisResponse,
 )
 from northstar_api.settings import DashboardSettings
 
@@ -294,6 +299,19 @@ def _latest_bar(bars: Sequence[FuturesOHLCVBar]) -> FuturesOHLCVBar | None:
 # ---------------------------------------------------------------------------
 
 
+def _requested_cutoff(as_of: str | None) -> PointInTime | None:
+    """Parse an explicit ``as_of``; None means the latest persisted session."""
+    if as_of is None:
+        return None
+    try:
+        return PointInTime(as_of)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="as_of must be an ISO-8601 timestamp with an explicit offset.",
+        ) from exc
+
+
 def _unavailable_state() -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -328,15 +346,8 @@ def futures_dashboard(request: Request, as_of: str | None = None) -> FuturesDash
         )
     settings, runtime = dashboard.settings, dashboard.runtime
 
-    if as_of is not None:
-        try:
-            cutoff: PointInTime | None = PointInTime(as_of)
-        except (TypeError, ValueError) as exc:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail="as_of must be an ISO-8601 timestamp with an explicit offset.",
-            ) from exc
-        source = "requested"
+    cutoff = _requested_cutoff(as_of)
+    source = "requested"
     try:
         bars = runtime.market_repository.get_bars(
             FuturesHistoricalMarketDataQuery(settings.contract, _DAILY)
@@ -379,4 +390,63 @@ def futures_dashboard(request: Request, as_of: str | None = None) -> FuturesDash
             ),
         ),
         operations=operations,
+    )
+
+
+@router.get("/futures/analysis", response_model=FuturesAnalysisResponse)
+def futures_analysis(request: Request, as_of: str | None = None) -> FuturesAnalysisResponse:
+    """Return the read-only paper and research analysis of the configured contract.
+
+    The cutoff follows the dashboard: an explicit ``as_of``, or else the latest
+    persisted daily bar of the contract. Research horizons are the frozen
+    baseline, 1 and 5 sessions.
+    """
+    dashboard = _dashboard(request)
+    if dashboard is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Futures dashboard is not configured.",
+        )
+    settings, runtime = dashboard.settings, dashboard.runtime
+    cutoff = _requested_cutoff(as_of)
+    source = "requested"
+    try:
+        if as_of is None:
+            latest = _latest_bar(
+                runtime.market_repository.get_bars(
+                    FuturesHistoricalMarketDataQuery(settings.contract, _DAILY)
+                )
+            )
+            cutoff = latest.point_in_time if latest is not None else None
+            source = "latest_persisted_session" if cutoff is not None else "none"
+        analysis = (
+            build_futures_analysis(runtime).execute(
+                settings.contract,
+                settings.strategy,
+                settings.portfolio,
+                ANALYSIS_HORIZONS,
+                cutoff,
+            )
+            if cutoff is not None
+            else None
+        )
+        paper, equity_curve, research, expiry = analysis_sections(
+            runtime, settings, analysis, cutoff, _NO_SESSION
+        )
+    except _PERSISTED_STATE_ERRORS as exc:
+        raise _unavailable_state() from exc
+
+    return FuturesAnalysisResponse(
+        context=AnalysisContextResponse(
+            contract=_contract(settings.contract),
+            strategy=settings.strategy.identity,
+            portfolio=settings.portfolio.identity,
+            cutoff=cutoff.value if cutoff is not None else None,
+            cutoff_source=source,
+            horizons=tuple(str(horizon.observations) for horizon in ANALYSIS_HORIZONS),
+        ),
+        paper=paper,
+        equity_curve=equity_curve,
+        research=research,
+        expiry=expiry,
     )

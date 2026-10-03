@@ -480,7 +480,11 @@ def test_the_futures_surface_is_get_only(book: Book) -> None:
     paths = _app(book).openapi()["paths"]
 
     assert set(paths["/health"]) == set(paths["/futures/dashboard"]) == {"get"}
-    assert [path for path in paths if path.startswith("/futures")] == ["/futures/dashboard"]
+    assert set(paths["/futures/analysis"]) == {"get"}
+    assert [path for path in paths if path.startswith("/futures")] == [
+        "/futures/dashboard",
+        "/futures/analysis",
+    ]
 
 
 # ---------------------------------------------------------------------------
