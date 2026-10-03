@@ -30,7 +30,14 @@ Exit codes:
                       ``operations daily`` this means the paper session completed
                       and was persisted but P&L was unavailable
     5  STATE          an immutable conflict, a mixed-strategy portfolio, a
-                      backward operational run, or malformed persisted state
+                      backward operational run, malformed persisted state, or a
+                      manual write refused because another writer holds the
+                      database's operations lock (nothing was changed)
+
+Every command that mutates the database -- ``economics set``, ``market-data
+sync``, ``paper run`` and ``operations daily`` -- holds that database's single
+operations lock for its whole run. ``operations daily`` treats a held lock as a
+safe skip and exits 0; a manual command refuses with 5.
     6  PROVIDER       the market-data provider or session calendar failed
 """
 
@@ -112,6 +119,7 @@ from northstar_api.operations import (
     latest_daily_bar,
     operation_logger,
 )
+from northstar_api.operations_lock import DatabaseOperationsLock, OperationsAlreadyActiveError
 from northstar_api.runtime import (
     DatabaseConfigurationError,
     DatabaseRuntime,
@@ -125,6 +133,7 @@ from northstar_api.settings import (
     OPERATION_VARIABLES,
     DashboardSettingsError,
     FuturesMarketDataProvider,
+    FuturesOperationSettings,
     load_market_data_provider,
     load_operation_settings,
 )
@@ -295,7 +304,8 @@ def _economics_set(args: argparse.Namespace, context: _Context) -> ExitCode:
     )
     economics = FuturesContractEconomics(contract, point_value)
 
-    accepted = context.database_runtime(_database(args)).economics_store.store((economics,))
+    with DatabaseOperationsLock(_database(args)):
+        accepted = context.database_runtime(_database(args)).economics_store.store((economics,))
     if isinstance(accepted, bool) or accepted != 1:
         raise CommandError(
             ExitCode.STATE, f"Economics store accepted {accepted!r} values, expected 1."
@@ -406,18 +416,19 @@ def _market_data_sync(args: argparse.Namespace, context: _Context) -> ExitCode:
     )
     provider = FuturesMarketDataProvider(args.provider)
 
-    acquisition, stopped = _market_acquisition(
-        context, provider, _database(args), "market-data sync"
-    )
-    context.write(
-        [
-            "MARKET DATA SYNC",
-            f"Provider: {provider.value}",
-            f"Contract: {contract}",
-            f"Date range: {start} .. {end} (trading dates)",
-        ]
-    )
-    result = _acquire(acquisition, query, stopped)
+    with DatabaseOperationsLock(_database(args)):
+        acquisition, stopped = _market_acquisition(
+            context, provider, _database(args), "market-data sync"
+        )
+        context.write(
+            [
+                "MARKET DATA SYNC",
+                f"Provider: {provider.value}",
+                f"Contract: {contract}",
+                f"Date range: {start} .. {end} (trading dates)",
+            ]
+        )
+        result = _acquire(acquisition, query, stopped)
 
     context.write(
         [
@@ -517,8 +528,11 @@ def _paper_run(args: argparse.Namespace, context: _Context) -> ExitCode:
     target = _parse("target", args.target, _count)
     as_of = _as_of(args)
 
-    runtime = context.database_runtime(_database(args))
-    _, valued = _run_paper_session(context, runtime, contract, strategy, portfolio, target, as_of)
+    with DatabaseOperationsLock(_database(args)):
+        runtime = context.database_runtime(_database(args))
+        _, valued = _run_paper_session(
+            context, runtime, contract, strategy, portfolio, target, as_of
+        )
     return ExitCode.SUCCESS if valued else ExitCode.DATA
 
 
@@ -598,6 +612,15 @@ def _daily_operation(context: _Context, log: logging.Logger) -> FuturesDailyOper
         raise CommandError(ExitCode.CONFIGURATION, str(error)) from error
     _require_clock_compatible_provider(context)
     api_key = _api_key(context, "operations daily")
+    # One lock for the whole cycle -- clock, sync and paper session -- never per step.
+    with DatabaseOperationsLock(settings.database):
+        return _daily_operation_cycle(context, log, settings, api_key)
+
+
+def _daily_operation_cycle(
+    context: _Context, log: logging.Logger, settings: FuturesOperationSettings, api_key: str
+) -> FuturesDailyOperationResult:
+    """Run the daily cycle; the caller holds the database's operations lock."""
     now = context.clock()
     captured = captured_instant(now)
     contract = settings.contract
@@ -687,6 +710,12 @@ def _operations_daily(args: argparse.Namespace, context: _Context) -> ExitCode:
     with operation_logger(context.err, context.secrets) as log:
         try:
             result = _daily_operation(context, log)
+        except OperationsAlreadyActiveError as active:
+            # Another runner owns this database; it does the work. A safe skip.
+            log.warning("daily operation skipped: another operations runner is active")
+            context.write(["DAILY OPERATION: SKIPPED", str(active)])
+            log.info("exit %s (%d)", ExitCode.SUCCESS.name, ExitCode.SUCCESS.value)
+            return ExitCode.SUCCESS
         except Exception as error:
             code, message = _classify(error)
             log.error("daily operation stopped: %s", message.splitlines()[0])
@@ -848,6 +877,8 @@ def _classify(error: Exception) -> tuple[ExitCode, str]:
         return error.code, error.message
     if isinstance(error, DatabaseConfigurationError):
         return ExitCode.CONFIGURATION, str(error)
+    if isinstance(error, OperationsAlreadyActiveError):
+        return ExitCode.STATE, str(error)
     if isinstance(
         error, FuturesTradingSessionInProgressError | FuturesContractEconomicsNotFoundError
     ):
