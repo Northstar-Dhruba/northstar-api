@@ -1,8 +1,10 @@
 """Read-only futures dashboard routes.
 
 Both routes read persisted state only, through the shared database runtime and
-GetFuturesPaperTradingSnapshotUseCase. Nothing here acquires market data,
-freezes or recomputes a recommendation, runs paper trading or writes SQLite.
+GetFuturesPaperTradingSnapshotUseCase; the operational status is derived from
+the same facts (``northstar_api.operational_status``). Nothing here acquires
+market data, freezes or recomputes a recommendation, runs paper trading or
+writes SQLite.
 The recommendation is exactly the latest frozen research record; a refresh can
 never create one. No wall clock is read: without ``as_of`` the cutoff is the
 latest persisted daily bar of the configured contract.
@@ -10,6 +12,7 @@ latest persisted daily bar of the configured contract.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from fastapi import APIRouter, HTTPException, Request, status
@@ -34,6 +37,7 @@ from northstar_infrastructure.persistence import (
     FuturesPaperTradingStorageError,
 )
 
+from northstar_api.operational_status import operational_status
 from northstar_api.runtime import DatabaseRuntime
 from northstar_api.schemas.futures import (
     FreshnessResponse,
@@ -277,11 +281,9 @@ def _recent(snapshot: FuturesPaperTradingSnapshot | None) -> tuple[RecentDecisio
     )
 
 
-def _latest_bar(runtime: DatabaseRuntime, contract: FuturesContract) -> FuturesOHLCVBar | None:
+def _latest_bar(bars: Sequence[FuturesOHLCVBar]) -> FuturesOHLCVBar | None:
     latest: FuturesOHLCVBar | None = None
-    for bar in runtime.market_repository.get_bars(
-        FuturesHistoricalMarketDataQuery(contract, _DAILY)
-    ):
+    for bar in bars:
         if latest is None or bar.point_in_time.compare(latest.point_in_time) > 0:
             latest = bar
     return latest
@@ -336,8 +338,11 @@ def futures_dashboard(request: Request, as_of: str | None = None) -> FuturesDash
             ) from exc
         source = "requested"
     try:
+        bars = runtime.market_repository.get_bars(
+            FuturesHistoricalMarketDataQuery(settings.contract, _DAILY)
+        )
         if as_of is None:
-            latest = _latest_bar(runtime, settings.contract)
+            latest = _latest_bar(bars)
             cutoff = latest.point_in_time if latest is not None else None
             source = "latest_persisted_session" if cutoff is not None else "none"
         snapshot = (
@@ -347,6 +352,10 @@ def futures_dashboard(request: Request, as_of: str | None = None) -> FuturesDash
             if cutoff is not None
             else None
         )
+        visible = tuple(
+            bar for bar in bars if cutoff is not None and bar.point_in_time.compare(cutoff) <= 0
+        )
+        operations = operational_status(settings, snapshot, visible)
     except _PERSISTED_STATE_ERRORS as exc:
         raise _unavailable_state() from exc
 
@@ -369,4 +378,5 @@ def futures_dashboard(request: Request, as_of: str | None = None) -> FuturesDash
                 latest_record.decision_instant.value if latest_record is not None else None
             ),
         ),
+        operations=operations,
     )

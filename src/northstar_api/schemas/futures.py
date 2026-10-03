@@ -152,6 +152,76 @@ class FreshnessResponse(BaseModel):
     latest_decision_instant: str | None
 
 
+class FinalityResponse(BaseModel):
+    """The configured daily-bar finality; never inferred from a clock.
+
+    ``next_session_outcome`` is the configured policy's assessment of the next
+    required session, or None when there is no such session.
+    """
+
+    mode: Literal["disabled", "operator-approved"]
+    final_through: str | None
+    next_session_outcome: Literal["FINAL", "NOT_YET_FINAL", "UNKNOWN"] | None
+    next_session_reason: str | None
+
+
+class OperationalBacklogResponse(BaseModel):
+    """Where chronological paper operation stands, from persisted facts only.
+
+    Sessions are NSE trading dates. ``next_required_session`` is the session
+    the next decision must be taken at, and ``next_required_cutoff`` its close.
+    ``final_sessions_pending`` counts sessions the configured finality already
+    treats as final but no decision covers yet; ``stored_sessions_pending``
+    counts persisted daily bars from the next required session on. Caught up
+    means neither count is positive. This is the latest processed state, not
+    the outcome of any particular run, which is not persisted.
+    """
+
+    status: Availability
+    reason: str | None
+    stage: Literal["go_live_required", "not_started", "operating", "rollover_required"] | None
+    go_live: str | None
+    latest_decision_session: str | None
+    latest_market_session: str | None
+    next_required_session: str | None
+    next_required_cutoff: str | None
+    final_sessions_pending: str | None
+    stored_sessions_pending: str | None
+    market_data_ahead: bool | None
+    caught_up: bool | None
+
+
+class ExpirySafetyResponse(BaseModel):
+    """The selected contract's pre-expiry flatten window, from the venue's guard.
+
+    ``sessions_after_latest_decision`` counts trading sessions after the latest
+    decision's session through expiry. ``window`` is ``flatten`` for the one
+    decision that must take the position flat (E-(K+1)) and ``protected`` from
+    E-K through expiry. ``reopening_blocked`` is whether the next decision is
+    governed by the guard, so no signal can open or increase the contract.
+    """
+
+    status: Availability
+    reason: str | None
+    expiry_session: str
+    flatten_sessions_before_expiry: str
+    sessions_after_latest_decision: str | None
+    window: Literal["outside", "flatten", "protected"] | None
+    flatten_required: bool | None
+    position_flat: bool | None
+    reopening_blocked: bool | None
+
+
+class OperationsResponse(BaseModel):
+    """Read-only chronological operational state; ``not_applicable`` off NSE."""
+
+    status: Literal["available", "not_applicable"]
+    reason: str | None
+    finality: FinalityResponse | None
+    backlog: OperationalBacklogResponse | None
+    expiry: ExpirySafetyResponse | None
+
+
 class FuturesDashboardResponse(BaseModel):
     contract: SelectedContractResponse
     research: ResearchResponse
@@ -161,6 +231,7 @@ class FuturesDashboardResponse(BaseModel):
     pnl: PnlResponse
     recent_decisions: tuple[RecentDecisionResponse, ...]
     freshness: FreshnessResponse
+    operations: OperationsResponse
 
 
 class HealthResponse(BaseModel):
