@@ -1,0 +1,15 @@
+[Unit]
+Description=Check hourly for approved Northstar India futures sessions
+
+[Timer]
+# A polling cadence, not a finality rule. Each run only checks whether approved
+# work exists: with finality disabled it waits, and with operator-approved
+# finality it processes sessions through NORTHSTAR_FUTURES_FINAL_THROUGH and
+# then waits. No trigger time can make an unapproved candle final. Hourly runs
+# pick up a new approval within the hour; a run with nothing approved makes no
+# provider request, and an overlapping run skips safely on the operations lock.
+OnCalendar=hourly
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,47 @@
+{
+	admin off
+	auto_https off
+}
+
+# Plain HTTP inside the container, published on host loopback only and reached
+# through an SSH tunnel; the CME site keeps ports 80 and 443.
+:8080 {
+	encode zstd gzip
+
+	# There is no application authentication; this is the boundary.
+	basic_auth {
+		{$NORTHSTAR_BASIC_AUTH_USER} {$NORTHSTAR_BASIC_AUTH_HASH}
+	}
+
+	header {
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy no-referrer
+		-Server
+	}
+
+	# Only the read-only Futures surface reaches the API:
+	# /api/health -> /health, /api/futures/dashboard -> /futures/dashboard.
+	# Every other API path or method -- including the legacy equity POST
+	# endpoints /analyze and /watchlist/refresh -- is answered here with 404.
+	handle_path /api/* {
+		@read {
+			method GET HEAD
+			path /health /futures/dashboard
+		}
+		handle @read {
+			reverse_proxy india-api:8000
+		}
+		handle {
+			respond 404
+		}
+	}
+
+	# Static dashboard. Nothing else is proxied, so an equity call made without
+	# the /api prefix only ever reaches the file server.
+	handle {
+		root * /srv
+		try_files {path} /index.html
+		file_server
+	}
+}

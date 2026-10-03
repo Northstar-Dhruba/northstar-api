@@ -1,0 +1,12 @@
+[Unit]
+Description=Northstar India futures operation (NIFTY / NSE / Upstox)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# deploy/india of the Indian checkout, holding its compose.yaml and .env. A
+# separate checkout from CME's, so building India never touches CME sources.
+WorkingDirectory=/opt/northstar-india/northstar-api/deploy/india
+ExecStart=/usr/bin/docker compose --project-name northstar-india run --rm --no-deps india-operations

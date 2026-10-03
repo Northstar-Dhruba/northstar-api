@@ -11,8 +11,9 @@ __pycache__/
 .venv/
 venv/
 
-# Deployment secrets
-deploy/.env
+# Secrets: every .env at any depth (repository root, deploy/, deploy/india/).
+# The .env.example templates stay tracked.
+.env
 
 # VS Code
 .vscode/
