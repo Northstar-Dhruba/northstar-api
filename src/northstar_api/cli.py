@@ -44,13 +44,15 @@ safe skip and exits 0; a manual command refuses with 5.
 from __future__ import annotations
 
 import argparse
+import io
 import logging
 import os
 import re
+import sqlite3
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import redirect_stderr, redirect_stdout
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from enum import IntEnum
@@ -80,6 +82,7 @@ from northstar_application.ports import (
     FuturesPaperFillConflictError,
     FuturesPaperOrderConflictError,
     FuturesSessionResolutionError,
+    FuturesTradingSession,
 )
 from northstar_core.derivatives import ExpirationDate
 from northstar_core.foundation.value_objects import (
@@ -102,6 +105,7 @@ from northstar_infrastructure.market_data import (
     ExchangeCalendarFuturesTradingSessionResolver,
     FuturesHistoricalStorageError,
     FuturesTradingSessionInProgressError,
+    NSEFuturesTradingSessionResolver,
     UpstoxMarketDataSourceError,
 )
 from northstar_infrastructure.persistence import (
@@ -113,29 +117,41 @@ from northstar_infrastructure.persistence import (
 from northstar_api import _cli_rendering as render
 from northstar_api.operations import (
     NO_HISTORY,
+    FuturesChronologicalOperationResult,
     FuturesDailyOperationResult,
+    FuturesOperationConfigurationError,
+    FuturesSessionBacklog,
     captured_instant,
     completed_sessions_after,
     latest_daily_bar,
+    latest_frozen_decision,
     operation_logger,
+    plan_session_backlog,
 )
 from northstar_api.operations_lock import DatabaseOperationsLock, OperationsAlreadyActiveError
 from northstar_api.runtime import (
     DatabaseConfigurationError,
     DatabaseRuntime,
     FuturesDailyAcquisition,
+    build_daily_bar_finality_policy,
     build_database_runtime,
     build_market_sync_runtime,
     build_upstox_market_sync_runtime,
 )
 from northstar_api.settings import (
+    DAILY_BAR_FINALITY_VARIABLE,
+    FINAL_THROUGH_VARIABLE,
+    GO_LIVE_VARIABLE,
     MARKET_DATA_PROVIDER_VARIABLE,
     OPERATION_VARIABLES,
     DashboardSettingsError,
+    FuturesDailyBarFinalityMode,
     FuturesMarketDataProvider,
     FuturesOperationSettings,
+    FuturesSessionOperationSettings,
     load_market_data_provider,
     load_operation_settings,
+    load_session_operation_settings,
 )
 
 API_KEY_VARIABLE = "DATABENTO_API_KEY"
@@ -580,41 +596,234 @@ def _summary(lines: Sequence[str]) -> str:
     return "; ".join(line for line in lines if line)
 
 
-def _require_clock_compatible_provider(context: _Context) -> None:
-    """Refuse a provider whose session finality the daily operation cannot decide.
+_CHRONOLOGICAL_VENUE = "NSE"
 
-    The daily operation chooses its acquisition range from the wall clock: a
-    session counts as complete once its resolved close has passed. That rule
-    is the Databento adapter's own completed-session guard. Whether an Upstox
-    daily candle is final at the session close is not established, so applying
-    the rule to Upstox would invent a finality policy. It is refused before any
-    secret or clock is read; Upstox ranges are acquired explicitly instead.
+
+def _configured(load):
+    try:
+        return load()
+    except DashboardSettingsError as error:
+        raise CommandError(ExitCode.CONFIGURATION, str(error)) from error
+
+
+def _daily_operation(
+    context: _Context, log: logging.Logger
+) -> FuturesDailyOperationResult | FuturesChronologicalOperationResult:
+    """Route to the provider's daily operation; each runs under one operations lock.
+
+    Databento keeps the established clock-decided, latest-only operation.
+    Upstox runs the chronological operation, which is clock-free and supports
+    only NSE contracts; the contract's own exchange decides that, not the
+    provider. Configuration and the provider secret are checked before the lock.
+
+    With finality disabled nothing can be acquired, so the Upstox secret is
+    neither required nor read; only operator-approved finality needs it.
     """
-    try:
-        provider = load_market_data_provider(context.env)
-    except DashboardSettingsError as error:
-        raise CommandError(ExitCode.CONFIGURATION, str(error)) from error
-    if provider is not FuturesMarketDataProvider.DATABENTO:
-        raise CommandError(
-            ExitCode.CONFIGURATION,
-            f"{MARKET_DATA_PROVIDER_VARIABLE}={provider.value} is not supported by "
-            "operations daily: it decides completed sessions from the wall clock, and "
-            f"{provider.value} daily-candle finality is not established. Acquire explicit "
-            f"ranges with 'northstar market-data sync --provider {provider.value} "
-            "--start ... --end ...'.",
+    settings = _configured(lambda: load_operation_settings(context.env))
+    provider = _configured(lambda: load_market_data_provider(context.env))
+    if provider is FuturesMarketDataProvider.UPSTOX:
+        session_settings = _configured(lambda: load_session_operation_settings(context.env))
+        venue = settings.contract.product.exchange_code.value
+        if venue != _CHRONOLOGICAL_VENUE:
+            raise CommandError(
+                ExitCode.CONFIGURATION,
+                f"{MARKET_DATA_PROVIDER_VARIABLE}=upstox operates {_CHRONOLOGICAL_VENUE} "
+                f"contracts only; {settings.contract} trades on {venue}.",
+            )
+        token = (
+            _secret(context, UPSTOX_TOKEN_VARIABLE, "Upstox", "operations daily")
+            if session_settings.finality_mode is FuturesDailyBarFinalityMode.OPERATOR_APPROVED
+            else None
         )
-
-
-def _daily_operation(context: _Context, log: logging.Logger) -> FuturesDailyOperationResult:
-    try:
-        settings = load_operation_settings(context.env)
-    except DashboardSettingsError as error:
-        raise CommandError(ExitCode.CONFIGURATION, str(error)) from error
-    _require_clock_compatible_provider(context)
+        # One lock for the whole cycle -- backlog, finality, sync and every session.
+        with DatabaseOperationsLock(settings.database):
+            return _chronological_daily_operation(context, log, settings, session_settings, token)
     api_key = _api_key(context, "operations daily")
     # One lock for the whole cycle -- clock, sync and paper session -- never per step.
     with DatabaseOperationsLock(settings.database):
         return _daily_operation_cycle(context, log, settings, api_key)
+
+
+def _finality_line(settings: FuturesSessionOperationSettings) -> str:
+    if settings.finality_mode is FuturesDailyBarFinalityMode.OPERATOR_APPROVED:
+        return (
+            f"Finality mode: {settings.finality_mode.value} "
+            f"(final through {settings.final_through.isoformat()})"
+        )
+    return f"Finality mode: {settings.finality_mode.value}"
+
+
+def _backlog_lines(backlog: FuturesSessionBacklog) -> list[str]:
+    latest = backlog.latest_decision.value if backlog.latest_decision else "none"
+    lines = [f"Latest frozen decision: {latest}"]
+    if backlog.go_live is not None:
+        lines.append(f"Go-live session: {backlog.go_live.isoformat()} (no decision frozen yet)")
+    lines.append("Sessions assessed:")
+    lines += [
+        f"  {a.session.trading_date.isoformat()} {a.outcome.value}: {a.reason}"
+        for a in backlog.assessments
+    ] or ["  none"]
+    return lines
+
+
+def _replay_latest_cutoff(
+    context: _Context,
+    runtime: DatabaseRuntime,
+    settings: FuturesOperationSettings,
+    latest: PointInTime,
+) -> None:
+    """Replay the latest frozen cutoff quietly so interrupted execution completes.
+
+    A decision can be frozen and its execution then fail. Replaying its own
+    cutoff is the existing idempotent paper run: it freezes nothing new,
+    creates a missing order under its deterministic identity, and writes
+    nothing when the cutoff already completed.
+    """
+    quiet = replace(context, out=io.StringIO(), err=io.StringIO())
+    _run_paper_session(
+        quiet,
+        runtime,
+        settings.contract,
+        settings.strategy,
+        settings.portfolio,
+        settings.target,
+        latest,
+    )
+
+
+def _chronological_daily_operation(
+    context: _Context,
+    log: logging.Logger,
+    settings: FuturesOperationSettings,
+    session_settings: FuturesSessionOperationSettings,
+    token: str | None,
+) -> FuturesChronologicalOperationResult:
+    """Process every eligible session in order; the caller holds the operations lock.
+
+    Nothing here reads a clock. Market data for the final sessions is acquired
+    as one range, then each session is paper-run at its own close, oldest
+    first, stopping at the first failure so no later decision is ever taken
+    past a session that did not complete.
+    """
+    contract = settings.contract
+    log.info("chronological daily operation started")
+    log.info(
+        "contract %s, strategy %s, portfolio %s, target %s",
+        contract,
+        settings.strategy.identity,
+        settings.portfolio.identity,
+        settings.target.value,
+    )
+    log.info("%s", _finality_line(session_settings).lower())
+
+    runtime = context.database_runtime(settings.database)
+    latest = latest_frozen_decision(runtime.forward_repository, contract, settings.strategy)
+    try:
+        backlog = plan_session_backlog(
+            NSEFuturesTradingSessionResolver(),
+            build_daily_bar_finality_policy(session_settings),
+            contract,
+            latest,
+            session_settings.go_live,
+        )
+    except FuturesOperationConfigurationError as error:
+        raise CommandError(ExitCode.CONFIGURATION, str(error)) from error
+    for assessment in backlog.assessments:
+        log.info(
+            "session %s finality %s: %s",
+            assessment.session.trading_date,
+            assessment.outcome.value,
+            assessment.reason,
+        )
+
+    header = [
+        "DAILY OPERATION: CHRONOLOGICAL",
+        "Provider: upstox",
+        f"Contract: {contract}",
+        f"Strategy: {settings.strategy.identity}",
+        f"Portfolio: {settings.portfolio.identity}",
+        _finality_line(session_settings),
+        *_backlog_lines(backlog),
+    ]
+
+    if backlog.exhausted:
+        if latest is not None:
+            _replay_latest_cutoff(context, runtime, settings, latest)
+        context.write([*header, "", "STATUS: ROLLOVER REQUIRED"])
+        log.warning("no trading session remains through expiry; rollover required")
+        raise CommandError(
+            ExitCode.CONFIGURATION,
+            f"Rollover required: {contract} has no trading session left to operate through "
+            "its expiry. Configure the next contract explicitly; nothing rolls automatically.",
+        )
+
+    waiting = backlog.waiting_on
+    if not backlog.eligible:
+        reason = waiting.reason if waiting is not None else "no session to process"
+        context.write([*header, "", f"STATUS: WAITING -- {reason}"])
+        log.info("waiting: %s", reason)
+        return FuturesChronologicalOperationResult(contract, backlog, 0, (), True)
+
+    first, last = backlog.eligible[0].trading_date, backlog.eligible[-1].trading_date
+    if token is None:
+        # Unreachable by design: only operator-approved finality yields final
+        # sessions, and that mode always reads the token. Fail closed regardless.
+        raise CommandError(
+            ExitCode.CONFIGURATION,
+            f"{UPSTOX_TOKEN_VARIABLE} is not set; operations daily needs Upstox credentials.",
+        )
+    acquisition = context.upstox_market_sync_runtime(settings.database, token)
+    acquired = _acquire(
+        acquisition,
+        FuturesDailyHistoricalAcquisitionQuery(contract, first, last),
+        _SYNC_NOTHING_STORED,
+    )
+    log.info(
+        "acquired %d sessions (%s .. %s), %d with a persisted daily bar",
+        acquired.session_count,
+        first,
+        last,
+        acquired.daily_bar_count,
+    )
+    context.write([*header, f"Acquired: {first} .. {last} ({acquired.session_count} sessions)"])
+
+    if latest is not None:
+        _replay_latest_cutoff(context, runtime, settings, latest)
+        log.info("latest frozen cutoff %s replayed idempotently", latest)
+
+    processed: list[FuturesTradingSession] = []
+    valued_all = True
+    for session in backlog.eligible:
+        context.write(["", f"SESSION {session.trading_date.isoformat()}"])
+        try:
+            result, valued = _run_paper_session(
+                context,
+                runtime,
+                contract,
+                settings.strategy,
+                settings.portfolio,
+                settings.target,
+                session.closes_at,
+            )
+        except Exception:
+            log.error("stopped at session %s; no later session was processed", session.trading_date)
+            raise
+        processed.append(session)
+        valued_all = valued_all and valued
+        log.info(
+            "session %s decision: %s; order: %s",
+            session.trading_date,
+            _summary(render.decision_lines(result)[2:]),
+            _summary(render.order_lines(result)[2:]),
+        )
+
+    status = [f"STATUS: COMPLETED -- {len(processed)} session(s) processed"]
+    if waiting is not None:
+        status.append(f"Waiting at {waiting.session.trading_date.isoformat()}: {waiting.reason}")
+    context.write(["", *status])
+    return FuturesChronologicalOperationResult(
+        contract, backlog, acquired.session_count, tuple(processed), valued_all
+    )
 
 
 def _daily_operation_cycle(
@@ -852,9 +1061,17 @@ def build_parser() -> argparse.ArgumentParser:
             "Environment:\n"
             + "".join(f"  {name}\n" for name in OPERATION_VARIABLES)
             + f"  {API_KEY_VARIABLE}  (secret; never echoed)\n"
-            + f"  {MARKET_DATA_PROVIDER_VARIABLE}  (optional; only databento is supported)\n\n"
+            + f"  {MARKET_DATA_PROVIDER_VARIABLE}  (optional; databento by default)\n\n"
             "Persisted history must first be bootstrapped with 'northstar market-data sync'.\n"
-            "The paper cutoff is the latest persisted daily bar, never the clock."
+            "The paper cutoff is the latest persisted daily bar, never the clock.\n\n"
+            f"With {MARKET_DATA_PROVIDER_VARIABLE}=upstox (NSE contracts only) the operation\n"
+            "reads no clock. It processes every session after the latest frozen decision\n"
+            "in order, each at its own close, but only sessions its finality policy treats\n"
+            "as final:\n"
+            f"  {UPSTOX_TOKEN_VARIABLE}  (secret; never echoed)\n"
+            f"  {DAILY_BAR_FINALITY_VARIABLE}  disabled (default) or operator-approved\n"
+            f"  {FINAL_THROUGH_VARIABLE}  last approved trading date (operator-approved)\n"
+            f"  {GO_LIVE_VARIABLE}  first session to operate while no decision is frozen"
         ),
     )
     daily_parser.set_defaults(handler=_operations_daily)
@@ -869,6 +1086,20 @@ def build_parser() -> argparse.ArgumentParser:
 def _fail(context: _Context, code: ExitCode, message: str) -> ExitCode:
     context.warn(f"{code.name} ERROR: {message}")
     return code
+
+
+def _database_busy(error: BaseException) -> bool:
+    """Return whether a storage error was caused by SQLite being locked or busy."""
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, sqlite3.OperationalError) and any(
+            word in str(current).lower() for word in ("locked", "busy")
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _classify(error: Exception) -> tuple[ExitCode, str]:
@@ -887,7 +1118,10 @@ def _classify(error: Exception) -> tuple[ExitCode, str]:
         # The contract and the session calendar disagree; a data fact, not a crash.
         return ExitCode.DATA, f"{type(error).__name__}: {error}"
     if isinstance(error, _STATE_ERRORS):
-        return ExitCode.STATE, f"{type(error).__name__}: {error}"
+        message = f"{type(error).__name__}: {error}"
+        if _database_busy(error):
+            message += " (database busy: another process holds the SQLite write lock; retry later)"
+        return ExitCode.STATE, message
     if isinstance(error, _PROVIDER_ERRORS):
         return ExitCode.PROVIDER, f"{type(error).__name__}: {error}"
     # The operator gets a concise message, never a traceback.
