@@ -4,7 +4,7 @@
     northstar market-data sync
     northstar paper run | status
     northstar operations daily
-    northstar finality-evidence observe
+    northstar finality-evidence observe | report
 
 The manual commands take every value on the command line; the only thing they
 read from the environment is the selected provider's secret -- DATABENTO_API_KEY
@@ -22,6 +22,10 @@ observation of an exact Upstox daily candle -- at the injected clock's instants
 -- to an explicit append-only JSON Lines file, and reads UPSTOX_ANALYTICS_TOKEN
 and nothing else from the environment. It never opens a Northstar database,
 never writes market data and never decides that a candle is final.
+``finality-evidence report`` reads such a file and derives, per contract and
+trading date, what was observed and when it was observed to change, timed from
+the NSE session close. It reads no environment, no clock and no database,
+contacts no provider and draws no conclusion.
 
 Summaries go to stdout; warnings and errors go to stderr.
 
@@ -126,6 +130,7 @@ from northstar_infrastructure.persistence import (
 )
 
 from northstar_api import _cli_rendering as render
+from northstar_api.finality_evidence import EvidenceFilters, build_report, report_lines
 from northstar_api.operations import (
     NO_HISTORY,
     FuturesChronologicalOperationResult,
@@ -554,6 +559,45 @@ def _finality_evidence_observe(args: argparse.Namespace, context: _Context) -> E
         ) from error
 
     context.write(_evidence_lines(observation, evidence))
+    return ExitCode.SUCCESS
+
+
+def _evidence_filters(args: argparse.Namespace) -> EvidenceFilters:
+    def value(name: str, label: str, build) -> str | None:
+        text = getattr(args, name)
+        return None if text is None else _parse(label, text, build).value
+
+    trading_date = args.trading_date
+    return EvidenceFilters(
+        product=value("product", "product", Symbol),
+        exchange=value("exchange", "exchange", ExchangeCode),
+        expiration=value("expiration", "expiration", ExpirationDate),
+        trading_date=None
+        if trading_date is None
+        else _parse("trading date", trading_date, _trading_date),
+    )
+
+
+def _finality_evidence_report(args: argparse.Namespace, context: _Context) -> ExitCode:
+    """Report what recorded evidence shows; read-only and offline.
+
+    Only the evidence file and the NSE calendar are read: no environment, no
+    clock, no database and no provider. Malformed evidence is refused, never
+    partially analysed.
+    """
+    filters = _evidence_filters(args)
+    evidence = Path(args.evidence)
+    if not evidence.is_file():
+        raise CommandError(ExitCode.CONFIGURATION, f"Evidence file not found: {evidence}")
+    try:
+        report = build_report(UpstoxCandleEvidenceLog(evidence).read(), filters)
+    except UpstoxCandleEvidenceLogError as error:
+        raise CommandError(ExitCode.STATE, f"{type(error).__name__}: {error}") from error
+    except OSError as error:
+        raise CommandError(
+            ExitCode.CONFIGURATION, f"Evidence file {evidence} cannot be read: {error}"
+        ) from error
+    context.write(report_lines(report, str(evidence), filters))
     return ExitCode.SUCCESS
 
 
@@ -1197,6 +1241,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--trading-date", required=True, help="the NSE trading session observed, YYYY-MM-DD"
     )
     observe_parser.set_defaults(handler=_finality_evidence_observe)
+    report_parser = evidence_commands.add_parser(
+        "report",
+        help=(
+            "report observed candles and observed changes per contract and trading date, "
+            "from an evidence file only (offline; no token)"
+        ),
+    )
+    report_parser.add_argument(
+        "--evidence", required=True, help="JSON Lines evidence file written by 'observe'"
+    )
+    report_parser.add_argument("--product", help="only this product code, e.g. NIFTY")
+    report_parser.add_argument("--exchange", help="only this exchange code, e.g. NSE")
+    report_parser.add_argument("--expiration", help="only this contract expiration, YYYY-MM-DD")
+    report_parser.add_argument("--trading-date", help="only this trading date, YYYY-MM-DD")
+    report_parser.set_defaults(handler=_finality_evidence_report)
     return parser
 
 
