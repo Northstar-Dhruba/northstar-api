@@ -4,6 +4,7 @@
     northstar market-data sync
     northstar paper run | status
     northstar operations daily
+    northstar finality-evidence observe
 
 The manual commands take every value on the command line; the only thing they
 read from the environment is the selected provider's secret -- DATABENTO_API_KEY
@@ -15,6 +16,12 @@ reads a clock: cutoffs and trading-date ranges are supplied by the operator.
 and the secret from the environment, reads the wall clock exactly once, syncs
 the completed sessions missing from persisted history, and runs the paper
 session at the latest persisted daily bar. It logs plain lines to stderr.
+
+``finality-evidence observe`` collects provider evidence only. It appends one
+observation of an exact Upstox daily candle -- at the injected clock's instants
+-- to an explicit append-only JSON Lines file, and reads UPSTOX_ANALYTICS_TOKEN
+and nothing else from the environment. It never opens a Northstar database,
+never writes market data and never decides that a candle is final.
 
 Summaries go to stdout; warnings and errors go to stderr.
 
@@ -106,6 +113,10 @@ from northstar_infrastructure.market_data import (
     FuturesHistoricalStorageError,
     FuturesTradingSessionInProgressError,
     NSEFuturesTradingSessionResolver,
+    UpstoxCandleEvidenceLog,
+    UpstoxCandleEvidenceLogError,
+    UpstoxDailyCandleEvidenceCollector,
+    UpstoxDailyCandleEvidenceObservation,
     UpstoxMarketDataSourceError,
 )
 from northstar_infrastructure.persistence import (
@@ -225,6 +236,10 @@ def _daily_sync_runtime(
     return build_market_sync_runtime(path, api_key, clock=clock)
 
 
+def _upstox_candle_evidence(token: str, clock: Clock) -> UpstoxDailyCandleEvidenceCollector:
+    return UpstoxDailyCandleEvidenceCollector(token, clock=clock)
+
+
 @dataclass(frozen=True, slots=True)
 class _Context:
     env: Mapping[str, str]
@@ -237,6 +252,9 @@ class _Context:
         build_upstox_market_sync_runtime
     )
     clock: Clock = _utc_now
+    upstox_candle_evidence: Callable[[str, Clock], UpstoxDailyCandleEvidenceCollector] = (
+        _upstox_candle_evidence
+    )
     # Secrets read by this invocation; every output line is scrubbed of them.
     secrets: list[str] = field(default_factory=list)
 
@@ -455,6 +473,87 @@ def _market_data_sync(args: argparse.Namespace, context: _Context) -> ExitCode:
             f"Sessions without trades: {result.session_count - result.daily_bar_count}",
         ]
     )
+    return ExitCode.SUCCESS
+
+
+# ---------------------------------------------------------------------------
+# finality-evidence
+# ---------------------------------------------------------------------------
+
+_EVIDENCE_VENUE = "NSE"
+
+
+def _evidence_lines(observation: UpstoxDailyCandleEvidenceObservation, evidence: Path) -> list[str]:
+    record = observation.to_record()
+    candle = record["candle"]
+    lines = [
+        "CANDLE EVIDENCE: OBSERVATION RECORDED",
+        f"Provider: {record['provider']}",
+        f"Contract: {observation.contract}",
+        f"Trading date: {record['trading_date']}",
+        f"Requested at: {record['requested_at']}",
+        f"Received at: {record['received_at']}",
+        f"Candle present: {'yes' if candle else 'no'}",
+    ]
+    if candle:
+        contracts = record["volume_contracts"]
+        if contracts is None:
+            contracts = f"unavailable ({record['volume_contracts_note']})"
+        lines += [
+            f"Open: {candle['open']}",
+            f"High: {candle['high']}",
+            f"Low: {candle['low']}",
+            f"Close: {candle['close']}",
+            f"Volume (provider units): {candle['volume']}",
+            f"Volume (contracts): {contracts}",
+            f"Open interest: {candle['open_interest'] or 'not provided'}",
+        ]
+    lines += [
+        f"Evidence file: {evidence}",
+        "Recorded as provider evidence only; one observation supports no conclusion.",
+    ]
+    return lines
+
+
+def _finality_evidence_observe(args: argparse.Namespace, context: _Context) -> ExitCode:
+    """Append one observation of an Upstox daily candle to an evidence file.
+
+    Evidence only: no Northstar database, market data, finality approval or
+    paper state is read or written. Provider failures append nothing.
+    """
+    contract = _contract(args)
+    trading_date = _parse("trading date", args.trading_date, _trading_date)
+    venue = contract.product.exchange_code.value
+    if venue != _EVIDENCE_VENUE:
+        raise CommandError(
+            ExitCode.INPUT,
+            f"finality-evidence observe supports {_EVIDENCE_VENUE} contracts only; "
+            f"{contract} trades on {venue}.",
+        )
+    # Resolver failures (a calendar that fails closed) propagate as PROVIDER.
+    if NSEFuturesTradingSessionResolver().resolve(contract.product, trading_date) is None:
+        raise CommandError(
+            ExitCode.INPUT,
+            f"{trading_date.isoformat()} is not an {_EVIDENCE_VENUE} futures trading session.",
+        )
+
+    evidence = Path(args.evidence)
+    log = UpstoxCandleEvidenceLog(evidence)
+    try:
+        log.require_appendable()  # before any provider request
+        token = _secret(context, UPSTOX_TOKEN_VARIABLE, "Upstox", "finality-evidence observe")
+        observation = context.upstox_candle_evidence(token, context.clock).observe(
+            contract, trading_date
+        )
+        log.append(observation)
+    except UpstoxCandleEvidenceLogError as error:
+        raise CommandError(ExitCode.STATE, f"{type(error).__name__}: {error}") from error
+    except OSError as error:
+        raise CommandError(
+            ExitCode.CONFIGURATION, f"Evidence file {evidence} cannot be used: {error}"
+        ) from error
+
+    context.write(_evidence_lines(observation, evidence))
     return ExitCode.SUCCESS
 
 
@@ -1075,6 +1174,29 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     daily_parser.set_defaults(handler=_operations_daily)
+
+    evidence = groups.add_parser(
+        "finality-evidence",
+        help="collect provider evidence about daily-candle revisions; decides nothing",
+    )
+    evidence_commands = evidence.add_subparsers(dest="command", required=True)
+    observe_parser = evidence_commands.add_parser(
+        "observe",
+        help=(
+            f"append one observation of an exact Upstox daily candle to an evidence file "
+            f"(needs {UPSTOX_TOKEN_VARIABLE}); writes no market data"
+        ),
+    )
+    observe_parser.add_argument(
+        "--evidence",
+        required=True,
+        help="append-only JSON Lines evidence file, kept outside every repository",
+    )
+    _add_contract(observe_parser)
+    observe_parser.add_argument(
+        "--trading-date", required=True, help="the NSE trading session observed, YYYY-MM-DD"
+    )
+    observe_parser.set_defaults(handler=_finality_evidence_observe)
     return parser
 
 
@@ -1143,6 +1265,9 @@ def main(
         [Path, str], FuturesDailyAcquisition
     ] = build_upstox_market_sync_runtime,
     clock: Clock = _utc_now,
+    upstox_candle_evidence: Callable[
+        [str, Clock], UpstoxDailyCandleEvidenceCollector
+    ] = _upstox_candle_evidence,
 ) -> int:
     """Run one command and return its exit code."""
     out = stdout if stdout is not None else sys.stdout
@@ -1162,6 +1287,7 @@ def main(
         daily_sync_runtime=daily_sync_runtime,
         upstox_market_sync_runtime=upstox_market_sync_runtime,
         clock=clock,
+        upstox_candle_evidence=upstox_candle_evidence,
     )
     try:
         return args.handler(args, context)
