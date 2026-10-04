@@ -1,8 +1,10 @@
 """Read-only futures dashboard routes.
 
 Both routes read persisted state only, through the shared database runtime and
-GetFuturesPaperTradingSnapshotUseCase. Nothing here acquires market data,
-freezes or recomputes a recommendation, runs paper trading or writes SQLite.
+GetFuturesPaperTradingSnapshotUseCase; the operational status is derived from
+the same facts (``northstar_api.operational_status``). Nothing here acquires
+market data, freezes or recomputes a recommendation, runs paper trading or
+writes SQLite.
 The recommendation is exactly the latest frozen research record; a refresh can
 never create one. No wall clock is read: without ``as_of`` the cutoff is the
 latest persisted daily bar of the configured contract.
@@ -10,18 +12,19 @@ latest persisted daily bar of the configured contract.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from northstar_application.application_services import (
     ForwardResearchContractViolationError,
+    FuturesContractEconomicsContractViolationError,
     FuturesHistoricalDataContractViolationError,
     FuturesPaperDecisionSnapshot,
     FuturesPaperPortfolioStrategyConflictError,
     FuturesPaperTradingContractViolationError,
     FuturesPaperTradingSnapshot,
-    FuturesProductEconomicsContractViolationError,
     InvalidFuturesPaperFillHistoryError,
 )
 from northstar_application.ports import FuturesHistoricalMarketDataQuery
@@ -29,12 +32,14 @@ from northstar_core.foundation.value_objects import PointInTime, Timeframe
 from northstar_core.futures import FuturesContract, FuturesOHLCVBar
 from northstar_infrastructure.market_data import FuturesHistoricalStorageError
 from northstar_infrastructure.persistence import (
+    FuturesContractEconomicsStorageError,
     FuturesForwardResearchStorageError,
     FuturesPaperTradingStorageError,
-    FuturesProductEconomicsStorageError,
 )
 
-from northstar_api.runtime import DatabaseRuntime
+from northstar_api.futures_analysis import ANALYSIS_HORIZONS, analysis_sections
+from northstar_api.operational_status import operational_status
+from northstar_api.runtime import DatabaseRuntime, build_futures_analysis
 from northstar_api.schemas.futures import (
     FreshnessResponse,
     FuturesContractResponse,
@@ -53,6 +58,10 @@ from northstar_api.schemas.futures import (
     ResearchResponse,
     SelectedContractResponse,
 )
+from northstar_api.schemas.futures_analysis import (
+    AnalysisContextResponse,
+    FuturesAnalysisResponse,
+)
 from northstar_api.settings import DashboardSettings
 
 POLICY = "built-in directional MVP"
@@ -64,14 +73,14 @@ _STORAGE_ERRORS: tuple[type[Exception], ...] = (
     FuturesHistoricalStorageError,
     FuturesForwardResearchStorageError,
     FuturesPaperTradingStorageError,
-    FuturesProductEconomicsStorageError,
+    FuturesContractEconomicsStorageError,
 )
 _PERSISTED_STATE_ERRORS: tuple[type[Exception], ...] = (
     *_STORAGE_ERRORS,
     FuturesPaperPortfolioStrategyConflictError,
     FuturesPaperTradingContractViolationError,
     ForwardResearchContractViolationError,
-    FuturesProductEconomicsContractViolationError,
+    FuturesContractEconomicsContractViolationError,
     FuturesHistoricalDataContractViolationError,
     InvalidFuturesPaperFillHistoryError,
 )
@@ -234,12 +243,12 @@ def _portfolio(settings: DashboardSettings, snapshot: FuturesPaperTradingSnapsho
 
 def _pnl(snapshot: FuturesPaperTradingSnapshot | None) -> PnlResponse:
     if snapshot is None:
-        return PnlResponse(status="unavailable", reason=_NO_SESSION, missing_product=None, rows=())
+        return PnlResponse(status="unavailable", reason=_NO_SESSION, missing_contract=None, rows=())
     if snapshot.valuation is None:
         return PnlResponse(
             status="unavailable",
-            reason="product economics not configured",
-            missing_product=str(snapshot.missing_economics),
+            reason="contract economics not configured",
+            missing_contract=_contract(snapshot.missing_economics),
             rows=(),
         )
     rows = []
@@ -259,7 +268,7 @@ def _pnl(snapshot: FuturesPaperTradingSnapshot | None) -> PnlResponse:
                 ),
             )
         )
-    return PnlResponse(status="available", reason=None, missing_product=None, rows=tuple(rows))
+    return PnlResponse(status="available", reason=None, missing_contract=None, rows=tuple(rows))
 
 
 def _recent(snapshot: FuturesPaperTradingSnapshot | None) -> tuple[RecentDecisionResponse, ...]:
@@ -277,11 +286,9 @@ def _recent(snapshot: FuturesPaperTradingSnapshot | None) -> tuple[RecentDecisio
     )
 
 
-def _latest_bar(runtime: DatabaseRuntime, contract: FuturesContract) -> FuturesOHLCVBar | None:
+def _latest_bar(bars: Sequence[FuturesOHLCVBar]) -> FuturesOHLCVBar | None:
     latest: FuturesOHLCVBar | None = None
-    for bar in runtime.market_repository.get_bars(
-        FuturesHistoricalMarketDataQuery(contract, _DAILY)
-    ):
+    for bar in bars:
         if latest is None or bar.point_in_time.compare(latest.point_in_time) > 0:
             latest = bar
     return latest
@@ -290,6 +297,19 @@ def _latest_bar(runtime: DatabaseRuntime, contract: FuturesContract) -> FuturesO
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+
+
+def _requested_cutoff(as_of: str | None) -> PointInTime | None:
+    """Parse an explicit ``as_of``; None means the latest persisted session."""
+    if as_of is None:
+        return None
+    try:
+        return PointInTime(as_of)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="as_of must be an ISO-8601 timestamp with an explicit offset.",
+        ) from exc
 
 
 def _unavailable_state() -> HTTPException:
@@ -309,7 +329,7 @@ def health(request: Request):
     if dashboard is None:
         return unavailable
     try:
-        dashboard.runtime.economics_repository.get_economics(dashboard.settings.contract.product)
+        dashboard.runtime.economics_repository.get_economics(dashboard.settings.contract)
     except _STORAGE_ERRORS:
         return unavailable
     return HealthResponse(status="ok")
@@ -326,18 +346,14 @@ def futures_dashboard(request: Request, as_of: str | None = None) -> FuturesDash
         )
     settings, runtime = dashboard.settings, dashboard.runtime
 
-    if as_of is not None:
-        try:
-            cutoff: PointInTime | None = PointInTime(as_of)
-        except (TypeError, ValueError) as exc:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail="as_of must be an ISO-8601 timestamp with an explicit offset.",
-            ) from exc
-        source = "requested"
+    cutoff = _requested_cutoff(as_of)
+    source = "requested"
     try:
+        bars = runtime.market_repository.get_bars(
+            FuturesHistoricalMarketDataQuery(settings.contract, _DAILY)
+        )
         if as_of is None:
-            latest = _latest_bar(runtime, settings.contract)
+            latest = _latest_bar(bars)
             cutoff = latest.point_in_time if latest is not None else None
             source = "latest_persisted_session" if cutoff is not None else "none"
         snapshot = (
@@ -347,6 +363,10 @@ def futures_dashboard(request: Request, as_of: str | None = None) -> FuturesDash
             if cutoff is not None
             else None
         )
+        visible = tuple(
+            bar for bar in bars if cutoff is not None and bar.point_in_time.compare(cutoff) <= 0
+        )
+        operations = operational_status(settings, snapshot, visible)
     except _PERSISTED_STATE_ERRORS as exc:
         raise _unavailable_state() from exc
 
@@ -369,4 +389,64 @@ def futures_dashboard(request: Request, as_of: str | None = None) -> FuturesDash
                 latest_record.decision_instant.value if latest_record is not None else None
             ),
         ),
+        operations=operations,
+    )
+
+
+@router.get("/futures/analysis", response_model=FuturesAnalysisResponse)
+def futures_analysis(request: Request, as_of: str | None = None) -> FuturesAnalysisResponse:
+    """Return the read-only paper and research analysis of the configured contract.
+
+    The cutoff follows the dashboard: an explicit ``as_of``, or else the latest
+    persisted daily bar of the contract. Research horizons are the frozen
+    baseline, 1 and 5 sessions.
+    """
+    dashboard = _dashboard(request)
+    if dashboard is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Futures dashboard is not configured.",
+        )
+    settings, runtime = dashboard.settings, dashboard.runtime
+    cutoff = _requested_cutoff(as_of)
+    source = "requested"
+    try:
+        if as_of is None:
+            latest = _latest_bar(
+                runtime.market_repository.get_bars(
+                    FuturesHistoricalMarketDataQuery(settings.contract, _DAILY)
+                )
+            )
+            cutoff = latest.point_in_time if latest is not None else None
+            source = "latest_persisted_session" if cutoff is not None else "none"
+        analysis = (
+            build_futures_analysis(runtime).execute(
+                settings.contract,
+                settings.strategy,
+                settings.portfolio,
+                ANALYSIS_HORIZONS,
+                cutoff,
+            )
+            if cutoff is not None
+            else None
+        )
+        paper, equity_curve, research, expiry = analysis_sections(
+            runtime, settings, analysis, cutoff, _NO_SESSION
+        )
+    except _PERSISTED_STATE_ERRORS as exc:
+        raise _unavailable_state() from exc
+
+    return FuturesAnalysisResponse(
+        context=AnalysisContextResponse(
+            contract=_contract(settings.contract),
+            strategy=settings.strategy.identity,
+            portfolio=settings.portfolio.identity,
+            cutoff=cutoff.value if cutoff is not None else None,
+            cutoff_source=source,
+            horizons=tuple(str(horizon.observations) for horizon in ANALYSIS_HORIZONS),
+        ),
+        paper=paper,
+        equity_curve=equity_curve,
+        research=research,
+        expiry=expiry,
     )

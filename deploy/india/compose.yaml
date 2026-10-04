@@ -1,0 +1,100 @@
+# Northstar Indian Futures paper environment: NIFTY / NSE / Upstox.
+#
+# Isolated from the CME stack (compose project `northstar`) in every respect:
+# project name, service names, image tags, volumes, environment file and
+# systemd units. Run every command from this directory of the Indian checkout:
+#
+#   docker compose build
+#   docker compose up -d                                # india-api + india-web
+#   docker compose run --rm --no-deps india-operations  # what the timer runs
+#
+# Builds use the Northstar workspace root of this checkout as context, so the
+# sibling Python repositories resolve exactly as they do in development.
+#
+# Code-frozen policy is not configured here: the K = 5 pre-expiry flatten, the
+# strategy, next-open fills and the NSE calendar live in the code. Finality is
+# never a time of day; it is disabled or explicitly operator-approved.
+
+name: northstar-india
+
+x-futures-settings: &futures-settings
+  # Must stay on the mounted local volume; never NFS, SMB or object storage.
+  NORTHSTAR_DATABASE: ${NORTHSTAR_DATABASE:-/data/northstar.sqlite3}
+  NORTHSTAR_FUTURES_PRODUCT: ${NORTHSTAR_FUTURES_PRODUCT:?set NORTHSTAR_FUTURES_PRODUCT in .env}
+  NORTHSTAR_FUTURES_EXCHANGE: ${NORTHSTAR_FUTURES_EXCHANGE:?set NORTHSTAR_FUTURES_EXCHANGE in .env}
+  NORTHSTAR_FUTURES_EXPIRATION: ${NORTHSTAR_FUTURES_EXPIRATION:?set NORTHSTAR_FUTURES_EXPIRATION in .env}
+  NORTHSTAR_STRATEGY: ${NORTHSTAR_STRATEGY:?set NORTHSTAR_STRATEGY in .env}
+  NORTHSTAR_PORTFOLIO: ${NORTHSTAR_PORTFOLIO:?set NORTHSTAR_PORTFOLIO in .env}
+  NORTHSTAR_TARGET: ${NORTHSTAR_TARGET:?set NORTHSTAR_TARGET in .env}
+  # Shared by the API (shown read-only on the dashboard) and the operation.
+  NORTHSTAR_FUTURES_DAILY_BAR_FINALITY: ${NORTHSTAR_FUTURES_DAILY_BAR_FINALITY:-disabled}
+  NORTHSTAR_FUTURES_FINAL_THROUGH: ${NORTHSTAR_FUTURES_FINAL_THROUGH:-}
+  NORTHSTAR_FUTURES_GO_LIVE: ${NORTHSTAR_FUTURES_GO_LIVE:-}
+
+services:
+  india-api:
+    build:
+      context: ../../..
+      dockerfile: northstar-api/deploy/Dockerfile.api
+    image: northstar-api:india
+    environment:
+      <<: *futures-settings
+      NORTHSTAR_WEB_ORIGIN: ${NORTHSTAR_WEB_ORIGIN:?set NORTHSTAR_WEB_ORIGIN in .env}
+    volumes:
+      - northstar-india-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4)
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    restart: unless-stopped
+
+  # Not a long-lived service: each `run --rm` reads .env afresh and is the only
+  # writer while it lasts; the runner itself holds the database operations lock.
+  india-operations:
+    image: northstar-api:india
+    profiles: [operations]
+    command: [northstar, operations, daily]
+    environment:
+      <<: *futures-settings
+      NORTHSTAR_FUTURES_MARKET_DATA_PROVIDER: upstox
+      UPSTOX_ANALYTICS_TOKEN: ${UPSTOX_ANALYTICS_TOKEN:-}
+    volumes:
+      - northstar-india-data:/data
+    restart: "no"
+
+  india-web:
+    build:
+      context: ../../..
+      dockerfile: northstar-api/deploy/Dockerfile.web
+    image: northstar-web:india
+    environment:
+      NORTHSTAR_BASIC_AUTH_USER: ${NORTHSTAR_BASIC_AUTH_USER:?set NORTHSTAR_BASIC_AUTH_USER in .env}
+      NORTHSTAR_BASIC_AUTH_HASH: ${NORTHSTAR_BASIC_AUTH_HASH:?set NORTHSTAR_BASIC_AUTH_HASH in .env}
+    # Loopback only, beside the CME site on 80/443: reach it through an SSH tunnel.
+    ports:
+      - "127.0.0.1:${NORTHSTAR_INDIA_WEB_PORT:-8081}:8080"
+    volumes:
+      # Replaces the CME Caddyfile baked into the shared web Dockerfile.
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - northstar-india-caddy-data:/data
+      - northstar-india-caddy-config:/config
+    depends_on:
+      india-api:
+        condition: service_healthy
+    restart: unless-stopped
+
+# Explicit names: the Docker volumes are exactly these, whatever project name
+# a command is given, and never the CME stack's northstar_northstar-data.
+volumes:
+  northstar-india-data:
+    name: northstar-india-data
+  northstar-india-caddy-data:
+    name: northstar-india-caddy-data
+  northstar-india-caddy-config:
+    name: northstar-india-caddy-config

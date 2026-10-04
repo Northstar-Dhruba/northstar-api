@@ -65,6 +65,9 @@ _ES_MAR = FuturesContract(_ES, ExpirationDate("2027-03-19"))
 _FESX_DEC = FuturesContract(
     FuturesProductReference(Symbol("FESX"), ExchangeCode("EUREX")), ExpirationDate("2026-12-18")
 )
+_NIFTY = FuturesProductReference(Symbol("NIFTY"), ExchangeCode("NSE"))
+_NIFTY_OCT = FuturesContract(_NIFTY, ExpirationDate("2026-10-27"))
+_NIFTY_NOV = FuturesContract(_NIFTY, ExpirationDate("2026-11-23"))
 _ALPHA = StrategyIdentity("alpha")
 _PORTFOLIO = PaperPortfolioIdentity("futures-paper-alpha")
 _ORIGIN = "http://localhost:5173"
@@ -143,10 +146,18 @@ class Book:
     def cli(self, *argv: str) -> int:
         return main(list(argv), env={}, stdout=io.StringIO(), stderr=io.StringIO())
 
-    def economics(self, product="ES", exchange="CME", point_value="50", currency="USD") -> Book:
+    def economics(
+        self,
+        product="ES",
+        exchange="CME",
+        point_value="50",
+        currency="USD",
+        expiration="2026-12-18",
+    ) -> Book:
         code = self.cli(
             "economics", "set", "--database", str(self.path), "--product", product,
-            "--exchange", exchange, "--point-value", point_value, "--currency", currency,
+            "--exchange", exchange, "--expiration", expiration,
+            "--point-value", point_value, "--currency", currency,
         )  # fmt: skip
         assert code == 0
         return self
@@ -469,7 +480,11 @@ def test_the_futures_surface_is_get_only(book: Book) -> None:
     paths = _app(book).openapi()["paths"]
 
     assert set(paths["/health"]) == set(paths["/futures/dashboard"]) == {"get"}
-    assert [path for path in paths if path.startswith("/futures")] == ["/futures/dashboard"]
+    assert set(paths["/futures/analysis"]) == {"get"}
+    assert [path for path in paths if path.startswith("/futures")] == [
+        "/futures/dashboard",
+        "/futures/analysis",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -557,7 +572,7 @@ def test_a_frozen_buy_is_shown_with_its_evidence_and_pending_order(book: Book) -
     assert dashboard["pnl"] == {
         "status": "available",
         "reason": None,
-        "missing_product": None,
+        "missing_contract": None,
         "rows": [],
     }
 
@@ -722,13 +737,43 @@ def test_missing_economics_keeps_every_other_section(book: Book) -> None:
 
     assert dashboard["pnl"] == {
         "status": "unavailable",
-        "reason": "product economics not configured",
-        "missing_product": "ES@CME",
+        "reason": "contract economics not configured",
+        "missing_contract": {"product": "ES", "exchange": "CME", "expiration": "2026-12-18"},
         "rows": [],
     }
+    assert "missing_product" not in dashboard["pnl"]
     assert dashboard["research"]["action"] == "BUY"
     assert dashboard["portfolio"]["positions"][0]["average_entry"] == "7650"
     assert dashboard["recent_decisions"][1]["order"]["state"] == "filled"
+
+
+def test_a_missing_expiry_is_named_without_implying_its_product_is_unconfigured(
+    book: Book,
+) -> None:
+    """INDIA-1: NIFTY OCT economics exist and NOV do not; only NOV is reported missing."""
+    book.economics().economics("NIFTY", "NSE", "65", "INR", "2026-10-27").history(1)
+    book.trade("nifty-oct", _NIFTY_OCT, OrderSide.BUY, 1, "24000")
+    book.trade("nifty-nov", _NIFTY_NOV, OrderSide.BUY, 1, "24050")
+
+    dashboard = _dashboard(book, f"as_of={_at(3)}")
+
+    assert dashboard["pnl"] == {
+        "status": "unavailable",
+        "reason": "contract economics not configured",
+        "missing_contract": {"product": "NIFTY", "exchange": "NSE", "expiration": "2026-11-23"},
+        "rows": [],
+    }
+
+    dashboard = _dashboard(
+        book.economics("NIFTY", "NSE", "65", "INR", "2026-11-23"), f"as_of={_at(3)}"
+    )
+
+    assert (dashboard["pnl"]["status"], dashboard["pnl"]["missing_contract"]) == ("available", None)
+    assert {
+        (row["contract"]["expiration"], row["settlement_currency"])
+        for row in dashboard["pnl"]["rows"]
+        if row["contract"]["product"] == "NIFTY"
+    } == {("2026-10-27", "INR"), ("2026-11-23", "INR")}
 
 
 def test_high_precision_values_stay_exact_strings(book: Book) -> None:
@@ -803,7 +848,7 @@ def test_a_mixed_strategy_portfolio_is_a_generic_500(book: Book) -> None:
 def test_corrupt_storage_is_a_generic_500(book: Book) -> None:
     book.economics().history().daily(26)
     with closing(sqlite3.connect(book.path)) as connection:
-        connection.execute("UPDATE futures_product_economics SET point_value_amount = '0'")
+        connection.execute("UPDATE futures_contract_economics SET point_value_amount = '0'")
         connection.commit()
 
     response = _get(_app(book), "/futures/dashboard")

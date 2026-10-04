@@ -16,7 +16,7 @@ from northstar_application.application_services import (
     FuturesPaperTradingValuation,
 )
 from northstar_core.foundation.value_objects import Money
-from northstar_core.futures import FuturesContract, FuturesProductEconomics
+from northstar_core.futures import FuturesContract, FuturesContractEconomics
 from northstar_core.paper_trading import FuturesPaperOrder, FuturesPaperPortfolio
 
 POLICY = "built-in directional MVP"
@@ -27,10 +27,10 @@ def money(value: Money) -> str:
     return f"{value.amount} {value.currency}"
 
 
-def economics_lines(economics: FuturesProductEconomics) -> list[str]:
+def economics_lines(economics: FuturesContractEconomics) -> list[str]:
     point_value = economics.point_value
     return [
-        f"Product: {economics.reference}",
+        f"Contract: {economics.contract}",
         f"Point value: {point_value.amount} {point_value.currency} / quote-point / contract",
     ]
 
@@ -87,6 +87,9 @@ def _execution_lines(result: FuturesPaperTradingDecisionResult) -> list[str]:
         f"Contracts: {intent.contracts.value}",
         f"ID: {result.order.identity.identity}",
     ]
+    if result.decision.expiry_flatten:
+        # Closes the position before the protected pre-expiry window, whatever the action.
+        lines.insert(3, "Expiry flatten: yes")
     if result.fill is not None:
         lines += [
             f"Simulated fill price: {result.fill.fill_quote.value}",
