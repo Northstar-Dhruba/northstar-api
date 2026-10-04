@@ -23,8 +23,8 @@ container; the volume is what separates them.
 
 | Service            | Image                 | Role                                                         |
 |--------------------|-----------------------|--------------------------------------------------------------|
-| `india-web`        | `northstar-web:india` | Caddy with `./Caddyfile`: basic auth, static dashboard, and only `GET /api/health` and `GET /api/futures/dashboard` proxied |
-| `india-api`        | `northstar-api:india` | Read-only dashboard API over the Indian volume; no provider secret |
+| `india-web`        | `northstar-web:india` | Caddy with `./Caddyfile`: basic auth, static dashboard, and only `GET`/`HEAD` on `/api/health`, `/api/futures/dashboard` and `/api/futures/analysis` proxied |
+| `india-api`        | `northstar-api:india` | Read-only dashboard and analysis API over the Indian volume; no provider secret |
 | `india-operations` | `northstar-api:india` | `northstar operations daily` with the Upstox provider, run per timer tick, then removed |
 
 ## Files

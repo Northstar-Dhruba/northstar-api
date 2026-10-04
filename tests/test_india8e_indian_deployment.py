@@ -365,13 +365,82 @@ def test_the_indian_caddyfile_proxies_only_read_only_routes() -> None:
     assert directives.count("reverse_proxy") == 1
     assert re.search(
         r"handle_path /api/\* \{\s*"
-        r"@read \{\s*method GET HEAD\s*path /health /futures/dashboard\s*\}\s*"
+        r"@read \{\s*method GET HEAD\s*path /health /futures/dashboard /futures/analysis\s*\}\s*"
         r"handle @read \{\s*reverse_proxy india-api:8000\s*\}\s*"
         r"handle \{\s*respond 404\s*\}\s*\}",
         directives,
     )
     for route in ("/analyze", "/watchlist", "POST", "api:8000\n"):
         assert route not in directives.replace("india-api:8000", "")
+
+
+def _read_matcher() -> tuple[set[str], set[str]]:
+    """Return the ``@read`` matcher's methods and exact paths from the Indian Caddyfile."""
+    directives = _directives(_read(_INDIA / "Caddyfile"))
+    block = re.search(r"@read \{(.*?)\}", directives, re.DOTALL).group(1)
+    methods = set(re.search(r"^\s*method (.+)$", block, re.MULTILINE).group(1).split())
+    paths = set(re.search(r"^\s*path (.+)$", block, re.MULTILINE).group(1).split())
+    return methods, paths
+
+
+def _proxied(method: str, path: str) -> bool:
+    """Whether the Indian Caddyfile forwards ``method path`` to the API.
+
+    Mirrors the configuration: only ``/api/*`` is considered, the prefix is
+    stripped, and the ``@read`` matcher's exact paths (no wildcard) and methods
+    decide; everything else under ``/api/*`` is answered with 404.
+    """
+    methods, paths = _read_matcher()
+    if not path.startswith("/api/"):
+        return False
+    return method in methods and path.removeprefix("/api") in paths
+
+
+def test_the_allow_list_is_exact_and_read_only() -> None:
+    methods, paths = _read_matcher()
+
+    assert methods == {"GET", "HEAD"}
+    assert paths == {"/health", "/futures/dashboard", "/futures/analysis"}
+    assert not any("*" in path for path in paths)  # never /futures/*
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "proxied"),
+    [
+        ("GET", "/api/futures/analysis", True),
+        ("HEAD", "/api/futures/analysis", True),
+        ("GET", "/api/futures/dashboard", True),
+        ("GET", "/api/health", True),
+        ("POST", "/api/futures/analysis", False),
+        ("PUT", "/api/futures/dashboard", False),
+        ("DELETE", "/api/futures/analysis", False),
+        ("PATCH", "/api/health", False),
+        ("GET", "/api/futures/analysis/extra", False),
+        ("GET", "/api/futures/run", False),
+        ("GET", "/api/futures", False),
+        ("POST", "/api/analyze", False),
+        ("GET", "/api/analyze", False),
+        ("POST", "/api/watchlist/refresh", False),
+        ("POST", "/analyze", False),
+        ("POST", "/watchlist/refresh", False),
+    ],
+)
+def test_the_caddy_decision_for_each_request(method: str, path: str, proxied: bool) -> None:
+    assert _proxied(method, path) is proxied
+
+
+def test_the_allow_list_matches_the_apis_read_only_futures_routes() -> None:
+    from northstar_api.app import create_app
+
+    routes = create_app().openapi()["paths"]
+    read_only = {
+        path
+        for path, operations in routes.items()
+        if path == "/health" or path.startswith("/futures")
+    }
+
+    assert all(set(routes[path]) == {"get"} for path in read_only)
+    assert _read_matcher()[1] == read_only
 
 
 # ---------------------------------------------------------------------------
