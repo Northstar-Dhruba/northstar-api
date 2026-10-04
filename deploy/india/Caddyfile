@@ -20,14 +20,15 @@
 		-Server
 	}
 
-	# Only the read-only Futures surface reaches the API:
-	# /api/health -> /health, /api/futures/dashboard -> /futures/dashboard.
-	# Every other API path or method -- including the legacy equity POST
+	# Only the read-only Futures surface reaches the API, by exact path:
+	# /api/health -> /health, /api/futures/dashboard -> /futures/dashboard,
+	# /api/futures/analysis -> /futures/analysis. Every other API path or
+	# method -- any other /api/futures/* path and the legacy equity POST
 	# endpoints /analyze and /watchlist/refresh -- is answered here with 404.
 	handle_path /api/* {
 		@read {
 			method GET HEAD
-			path /health /futures/dashboard
+			path /health /futures/dashboard /futures/analysis
 		}
 		handle @read {
 			reverse_proxy india-api:8000
