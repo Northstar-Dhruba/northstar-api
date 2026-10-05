@@ -16,6 +16,9 @@ reads a clock: cutoffs and trading-date ranges are supplied by the operator.
 and the secret from the environment, reads the wall clock exactly once, syncs
 the completed sessions missing from persisted history, and runs the paper
 session at the latest persisted daily bar. It logs plain lines to stderr.
+With the Upstox provider it reads the clock exactly once, only after eligible
+final sessions exist and the token is available, solely to route the venue's
+current date to Upstox's current-day endpoint; finality never reads it.
 
 ``finality-evidence observe`` collects provider evidence only. It appends one
 observation of an exact Upstox daily candle -- at the injected clock's instants
@@ -68,7 +71,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from enum import IntEnum
 from pathlib import Path
-from typing import TextIO
+from typing import Protocol, TextIO
 
 from northstar_application.application_services import (
     AcquireFuturesDailyHistoryUseCase,
@@ -228,6 +231,19 @@ _PROVIDER_ERRORS: tuple[type[Exception], ...] = (
 )
 
 Clock = Callable[[], datetime]
+
+
+class UpstoxAcquisitionFactory(Protocol):
+    """Builds Upstox acquisition; ``current_instant`` enables current-day routing.
+
+    Manual ``market-data sync`` never passes it, so it stays historical-only.
+    """
+
+    def __call__(
+        self, path: Path, access_token: str, *, current_instant: datetime | None = None
+    ) -> FuturesDailyAcquisition: ...
+
+
 DailySyncRuntime = Callable[[Path, str, Clock], AcquireFuturesDailyHistoryUseCase]
 
 
@@ -253,9 +269,7 @@ class _Context:
     database_runtime: Callable[[Path], DatabaseRuntime]
     market_sync_runtime: Callable[[Path, str], AcquireFuturesDailyHistoryUseCase]
     daily_sync_runtime: DailySyncRuntime = _daily_sync_runtime
-    upstox_market_sync_runtime: Callable[[Path, str], FuturesDailyAcquisition] = (
-        build_upstox_market_sync_runtime
-    )
+    upstox_market_sync_runtime: UpstoxAcquisitionFactory = build_upstox_market_sync_runtime
     clock: Clock = _utc_now
     upstox_candle_evidence: Callable[[str, Clock], UpstoxDailyCandleEvidenceCollector] = (
         _upstox_candle_evidence
@@ -755,9 +769,10 @@ def _daily_operation(
     """Route to the provider's daily operation; each runs under one operations lock.
 
     Databento keeps the established clock-decided, latest-only operation.
-    Upstox runs the chronological operation, which is clock-free and supports
-    only NSE contracts; the contract's own exchange decides that, not the
-    provider. Configuration and the provider secret are checked before the lock.
+    Upstox runs the chronological operation, whose eligibility and finality
+    read no clock, and which supports only NSE contracts; the contract's own
+    exchange decides that, not the provider. Configuration and the provider
+    secret are checked before the lock.
 
     With finality disabled nothing can be acquired, so the Upstox secret is
     neither required nor read; only operator-approved finality needs it.
@@ -843,10 +858,13 @@ def _chronological_daily_operation(
 ) -> FuturesChronologicalOperationResult:
     """Process every eligible session in order; the caller holds the operations lock.
 
-    Nothing here reads a clock. Market data for the final sessions is acquired
-    as one range, then each session is paper-run at its own close, oldest
-    first, stopping at the first failure so no later decision is ever taken
-    past a session that did not complete.
+    Eligibility and finality read no clock. Only once eligible final sessions
+    exist and the token is available is the clock read -- exactly once -- and
+    that captured instant only routes the venue's current date to Upstox's
+    current-day endpoint. Market data for the final sessions is acquired as one
+    range, then each session is paper-run at its own close, oldest first,
+    stopping at the first failure so no later decision is ever taken past a
+    session that did not complete.
     """
     contract = settings.contract
     log.info("chronological daily operation started")
@@ -915,7 +933,11 @@ def _chronological_daily_operation(
             ExitCode.CONFIGURATION,
             f"{UPSTOX_TOKEN_VARIABLE} is not set; operations daily needs Upstox credentials.",
         )
-    acquisition = context.upstox_market_sync_runtime(settings.database, token)
+    # The one clock read, after eligibility: it routes the venue's current date
+    # to the current-day endpoint and decides nothing about finality.
+    now = context.clock()
+    captured_instant(now)  # refuses a naive instant
+    acquisition = context.upstox_market_sync_runtime(settings.database, token, current_instant=now)
     acquired = _acquire(
         acquisition,
         FuturesDailyHistoricalAcquisitionQuery(contract, first, last),
@@ -1207,10 +1229,11 @@ def build_parser() -> argparse.ArgumentParser:
             + f"  {MARKET_DATA_PROVIDER_VARIABLE}  (optional; databento by default)\n\n"
             "Persisted history must first be bootstrapped with 'northstar market-data sync'.\n"
             "The paper cutoff is the latest persisted daily bar, never the clock.\n\n"
-            f"With {MARKET_DATA_PROVIDER_VARIABLE}=upstox (NSE contracts only) the operation\n"
-            "reads no clock. It processes every session after the latest frozen decision\n"
-            "in order, each at its own close, but only sessions its finality policy treats\n"
-            "as final:\n"
+            f"With {MARKET_DATA_PROVIDER_VARIABLE}=upstox (NSE contracts only) eligibility and\n"
+            "finality read no clock. It processes every session after the latest frozen\n"
+            "decision in order, each at its own close, but only sessions its finality policy\n"
+            "treats as final; once such sessions exist it reads the clock once, only to fetch\n"
+            "the venue's current date from Upstox's current-day endpoint:\n"
             f"  {UPSTOX_TOKEN_VARIABLE}  (secret; never echoed)\n"
             f"  {DAILY_BAR_FINALITY_VARIABLE}  disabled (default) or operator-approved\n"
             f"  {FINAL_THROUGH_VARIABLE}  last approved trading date (operator-approved)\n"
@@ -1320,9 +1343,7 @@ def main(
         [Path, str], AcquireFuturesDailyHistoryUseCase
     ] = build_market_sync_runtime,
     daily_sync_runtime: DailySyncRuntime = _daily_sync_runtime,
-    upstox_market_sync_runtime: Callable[
-        [Path, str], FuturesDailyAcquisition
-    ] = build_upstox_market_sync_runtime,
+    upstox_market_sync_runtime: UpstoxAcquisitionFactory = build_upstox_market_sync_runtime,
     clock: Clock = _utc_now,
     upstox_candle_evidence: Callable[
         [str, Clock], UpstoxDailyCandleEvidenceCollector

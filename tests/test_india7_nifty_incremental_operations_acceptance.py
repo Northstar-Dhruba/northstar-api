@@ -193,34 +193,46 @@ class FakeUpstox:
     candle_error: Exception | None = None
     master_has_contract: bool = True
     candle_requests: list[tuple[str, str]] = field(default_factory=list)
+    # Upstox's current-day endpoint: the bar it serves, if any, and its failure.
+    current_day_bar: int | None = None
+    current_day_error: Exception | None = None
+    current_day_requests: int = 0
 
     def __call__(self, url: str, headers, timeout: float) -> bytes:
         if url == NSE_INSTRUMENT_MASTER_URL:
             return _master(self.master_has_contract)
+        if "/historical-candle/intraday/" in url:
+            self.current_day_requests += 1
+            if self.current_day_error is not None:
+                raise self.current_day_error
+            rows = [] if self.current_day_bar is None else [self._row(self.current_day_bar)]
+            return json.dumps({"status": "success", "data": {"candles": rows}}).encode("utf-8")
         if self.candle_error is not None:
             raise self.candle_error
         *_, to, start = url.rstrip("/").split("/")
         self.candle_requests.append((start, to))
         first, last = date.fromisoformat(start), date.fromisoformat(to)
-        rows = []
-        for bar, session in enumerate(_SESSIONS, start=1):
-            if not first <= session.trading_date <= last or bar in self.omit:
-                continue
-            open_ = self.market.open_(bar)
-            close = self.revised.get(bar, self.market.close(bar))
-            rows.append(
-                [
-                    f"{session.trading_date.isoformat()}T00:00:00+05:30",
-                    int(open_),
-                    int(max(open_, close) + 5),
-                    int(min(open_, close) - 5),
-                    int(close),
-                    self.market.volumes[bar - 1] * _LOT,
-                    0,
-                ]
-            )
+        rows = [
+            self._row(bar)
+            for bar, session in enumerate(_SESSIONS, start=1)
+            if first <= session.trading_date <= last and bar not in self.omit
+        ]
         rows.reverse()  # newest first, as Upstox returns them
         return json.dumps({"status": "success", "data": {"candles": rows}}).encode("utf-8")
+
+    def _row(self, bar: int) -> list[object]:
+        session = _SESSIONS[bar - 1]
+        open_ = self.market.open_(bar)
+        close = self.revised.get(bar, self.market.close(bar))
+        return [
+            f"{session.trading_date.isoformat()}T00:00:00+05:30",
+            int(open_),
+            int(max(open_, close) + 5),
+            int(min(open_, close) - 5),
+            int(close),
+            self.market.volumes[bar - 1] * _LOT,
+            0,
+        ]
 
 
 # ---------------------------------------------------------------------------
