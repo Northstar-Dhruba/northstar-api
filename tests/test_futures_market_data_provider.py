@@ -360,16 +360,39 @@ def test_the_composition_root_reads_no_clock_for_upstox() -> None:
         if isinstance(node, ast.FunctionDef) and node.name == "build_upstox_market_sync_runtime"
     )
 
+    # The builder reads no clock: it only forwards an instant its caller captured.
     for node in ast.walk(builder):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
             assert node.func.attr not in {"now", "utcnow", "today", "time", "monotonic"}
         if isinstance(node, ast.Name):
-            assert node.id not in {"clock", "datetime"}
+            assert node.id != "clock"
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             for cutoff in ("16:00", "19:00", "21:00", "previous day", "next morning"):
                 assert cutoff not in node.value
     assert [a.arg for a in builder.args.args] == ["path", "access_token"]
-    assert [a.arg for a in builder.args.kwonlyargs] == ["fetch"]
+    assert [a.arg for a in builder.args.kwonlyargs] == ["fetch", "current_instant"]
+    assert [ast.unparse(d) for d in builder.args.kw_defaults] == ["None", "None"]
+
+
+def test_manual_upstox_sync_supplies_no_current_instant(database: Path) -> None:
+    """Manual sync stays historical-only: no instant, no current-day request, no clock."""
+    fake = FakeUpstox()
+    received: list[dict] = []
+
+    def build(path: Path, token: str, **kwargs) -> AcquireFuturesNativeDailyHistoryUseCase:
+        received.append(kwargs)
+        return build_upstox_market_sync_runtime(path, token, fetch=fake, **kwargs)
+
+    outcome = _cli(
+        [*_UPSTOX_SYNC, "--database", str(database)],
+        env={"UPSTOX_ANALYTICS_TOKEN": _UPSTOX_TOKEN},
+        upstox_market_sync_runtime=build,
+        clock=_never_called_clock,
+    )
+
+    assert outcome.code == ExitCode.SUCCESS, outcome.err
+    assert received == [{}]
+    assert not any("/historical-candle/intraday/" in url for url in fake.urls)
 
 
 # ---------------------------------------------------------------------------
