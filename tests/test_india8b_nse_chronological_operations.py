@@ -5,7 +5,10 @@ runs the chronological operation: under one operations lock it derives the
 backlog from persisted facts (the latest frozen decision, or an explicit go-live
 session), assesses each resolved NSE session with the configured finality
 policy, acquires the final sessions as one range and paper-runs each session at
-its own close, oldest first, stopping at the first failure. It reads no clock.
+its own close, oldest first, stopping at the first failure. Eligibility and
+finality read no clock; once eligible final sessions exist and the token is
+available, the clock is read exactly once, only to route the venue's current
+date to Upstox's current-day endpoint.
 
 Everything runs through the production CLI and runtime on temporary SQLite, on
 real NSE sessions. The synthetic markets, the range-honouring Upstox transport
@@ -20,7 +23,7 @@ import io
 import socket
 import sqlite3
 from contextlib import closing
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from urllib.error import HTTPError
@@ -121,16 +124,40 @@ def _env(
     return env
 
 
-def _daily(op: Operator, fetch=None, **settings) -> Outcome:
+class _Clock:
+    """Returns one fixed aware instant and counts how often it was read."""
+
+    def __init__(self, instant: datetime) -> None:
+        self.instant = instant
+        self.reads = 0
+
+    def __call__(self) -> datetime:
+        self.reads += 1
+        return self.instant
+
+
+# After the contract's life: every operated session is historical.
+_AFTER_THE_CONTRACT = datetime(2026, 11, 2, 12, 0, tzinfo=UTC)
+
+
+def _on_session(bar: int) -> datetime:
+    """17:30 IST on the bar's own trading date: that session is the venue's today."""
+    day = date.fromisoformat(_day(bar))
+    return datetime(day.year, day.month, day.day, 12, 0, tzinfo=UTC)
+
+
+def _daily(op: Operator, fetch=None, *, clock=None, **settings) -> Outcome:
     out, err = io.StringIO(), io.StringIO()
     code = main(
         ["operations", "daily"],
         env=_env(op, **settings),
         stdout=out,
         stderr=err,
-        clock=_never_read_the_clock,
-        upstox_market_sync_runtime=lambda path, token: build_upstox_market_sync_runtime(
-            path, token, fetch=fetch or op.upstox
+        clock=clock or _Clock(_AFTER_THE_CONTRACT),
+        upstox_market_sync_runtime=lambda path, token, current_instant=None: (
+            build_upstox_market_sync_runtime(
+                path, token, fetch=fetch or op.upstox, current_instant=current_instant
+            )
         ),
     )
     return Outcome(code, out.getvalue(), err.getvalue())
@@ -395,6 +422,7 @@ def test_a_missing_expected_candle_is_data_and_nothing_is_decided(tmp_path: Path
     assert run.code == ExitCode.DATA
     assert "FuturesDailySessionCoverageError" in run.err
     assert _decisions(op) == [] and len(op.facts()["bars"]) == 20
+    assert op.upstox.current_day_requests == 0  # a missing past candle stays historical
 
 
 # ---------------------------------------------------------------------------
@@ -557,19 +585,22 @@ class _NoNow(datetime):
         raise AssertionError("datetime.utcnow() read on the chronological path")
 
 
-def test_the_chronological_path_never_reads_the_clock(
+def test_the_chronological_path_reads_the_clock_once_only_for_routing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from northstar_api import operations, runtime
 
-    op = _operator(tmp_path, "clock-free")
+    op = _operator(tmp_path, "one-clock-read")
     for module in (cli_module, operations, runtime):
         monkeypatch.setattr(module, "datetime", _NoNow)
     monkeypatch.setattr(cli_module, "_utc_now", _never_read_the_clock)
+    # An aware instant of the patched class, so isinstance checks still see a datetime.
+    clock = _Clock(_NoNow(2026, 11, 2, 12, 0, tzinfo=UTC))
 
-    run = _daily(op, final_through=23, go_live=21)
+    run = _daily(op, clock=clock, final_through=23, go_live=21)
 
     assert run.code == ExitCode.SUCCESS, run.err
+    assert clock.reads == 1  # the injected clock, once; never the wall clock
     assert _decisions(op) == [_close(21), _close(22), _close(23)]
 
 
@@ -624,7 +655,9 @@ def test_daily_help_documents_the_chronological_settings() -> None:
         "UPSTOX_ANALYTICS_TOKEN",
     ):
         assert name in text
-    assert "operator-approved" in text and "reads no clock" in text
+    assert "operator-approved" in text
+    assert "finality read no clock" in text and "reads the clock once" in text
+    assert "current-day endpoint" in text
 
 
 def test_market_bars_were_stamped_by_the_production_path(tmp_path: Path) -> None:
@@ -701,3 +734,84 @@ def test_operator_approved_without_a_token_is_configuration(tmp_path: Path) -> N
     assert "UPSTOX_ANALYTICS_TOKEN" in env.read
     assert built == [] and _requests_after(op, requests) == []
     assert op.facts() == before
+
+
+# ---------------------------------------------------------------------------
+# The venue's current date: routed once, after eligibility
+# ---------------------------------------------------------------------------
+
+
+def test_waiting_reads_no_clock_and_makes_no_provider_request(tmp_path: Path) -> None:
+    op = _operator(tmp_path, "waiting-no-clock")
+    requests = len(op.upstox.candle_requests)
+
+    # Operator-approved, but nothing is approved yet: go-live 21 is after final-through 20.
+    run = _daily(op, clock=_never_read_the_clock, final_through=20, go_live=21)
+
+    assert run.code == ExitCode.SUCCESS, run.err
+    assert "STATUS: WAITING" in run.out
+    assert _requests_after(op, requests) == [] and op.upstox.current_day_requests == 0
+
+
+def test_an_eligible_same_day_session_comes_from_the_current_day_endpoint(
+    tmp_path: Path,
+) -> None:
+    op = _operator(tmp_path, "same-day")
+    op.upstox.current_day_bar = 22
+    requests = len(op.upstox.candle_requests)
+    clock = _Clock(_on_session(22))
+
+    run = _daily(op, clock=clock, final_through=22, go_live=21)
+
+    assert run.code == ExitCode.SUCCESS, run.err
+    assert clock.reads == 1
+    assert _decisions(op) == [_close(21), _close(22)]
+    the_day_before = (date.fromisoformat(_day(22)) - timedelta(days=1)).isoformat()
+    assert _requests_after(op, requests) == [(_day(21), the_day_before)]
+    assert op.upstox.current_day_requests == 1
+    assert op.facts()["bars"][-1].point_in_time.value == _close(22)
+
+
+def test_eligible_past_sessions_stay_historical(tmp_path: Path) -> None:
+    op = _operator(tmp_path, "past-only")
+    op.upstox.current_day_error = AssertionError("current-day endpoint must not be called")
+    clock = _Clock(_on_session(26))  # venue today is after the eligible range
+
+    run = _daily(op, clock=clock, final_through=23, go_live=21)
+
+    assert run.code == ExitCode.SUCCESS, run.err
+    assert clock.reads == 1
+    assert op.upstox.current_day_requests == 0
+    assert _decisions(op) == [_close(21), _close(22), _close(23)]
+
+
+def test_a_current_day_failure_affects_only_a_same_day_operation(tmp_path: Path) -> None:
+    failure = HTTPError("https://api.upstox.com/v3/x", 503, "unavailable", {}, io.BytesIO(b""))
+
+    same_day = _operator(tmp_path, "same-day-failure")
+    same_day.upstox.current_day_error = failure
+    run = _daily(same_day, clock=_Clock(_on_session(22)), final_through=22, go_live=21)
+    assert run.code == ExitCode.PROVIDER
+    assert "UpstoxProviderUnavailableError" in run.err
+    assert _decisions(same_day) == []
+
+    past = _operator(tmp_path, "past-unaffected")
+    past.upstox.current_day_error = failure
+    run = _daily(past, clock=_Clock(_on_session(26)), final_through=22, go_live=21)
+    assert run.code == ExitCode.SUCCESS, run.err
+    assert _decisions(past) == [_close(21), _close(22)]
+
+
+def test_eligibility_never_depends_on_the_routing_clock(tmp_path: Path) -> None:
+    near = _operator(tmp_path, "near")
+    far = _operator(tmp_path, "far")
+
+    first = _daily(near, clock=_Clock(_AFTER_THE_CONTRACT), final_through=23, go_live=21)
+    second = _daily(
+        far, clock=_Clock(datetime(2099, 1, 1, tzinfo=UTC)), final_through=23, go_live=21
+    )
+
+    assert first.code == second.code == ExitCode.SUCCESS
+    assert _decisions(near) == _decisions(far) == [_close(21), _close(22), _close(23)]
+    assessed = [line for line in first.out.splitlines() if "FINAL" in line]
+    assert assessed == [line for line in second.out.splitlines() if "FINAL" in line]

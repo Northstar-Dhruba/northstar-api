@@ -278,22 +278,33 @@ def build_market_sync_runtime(
 
 
 def build_upstox_market_sync_runtime(
-    path: Path, access_token: str, *, fetch: UpstoxFetch | None = None
+    path: Path,
+    access_token: str,
+    *,
+    fetch: UpstoxFetch | None = None,
+    current_instant: datetime | None = None,
 ) -> AcquireFuturesNativeDailyHistoryUseCase:
     """Initialize the database and wire Upstox native daily acquisition into it.
 
-    No clock is involved anywhere on this path. Unlike the Databento adapter,
-    the Upstox adapter has no completed-session guard, and none is added here:
-    whether a session's daily candle is final is not established, so the
-    caller's explicit trading-date range is the only eligibility rule.
+    This builder reads no clock. Unlike the Databento adapter, the Upstox
+    adapter has no completed-session guard, and none is added here: whether a
+    session's daily candle is final is not established, so the caller's
+    explicit trading-date range is the only eligibility rule.
+
+    ``current_instant`` is an aware instant the caller captured once. With it,
+    the adapter serves that instant's venue date from Upstox's current-day
+    endpoint; without it -- manual ``market-data sync`` -- every date is
+    historical. It routes endpoints only and decides no eligibility.
 
     ``fetch`` replaces the adapter's HTTP transport, for tests only.
     """
     initialize_database(path)
     source = (
-        UpstoxFuturesNativeDailyMarketDataSource(access_token)
+        UpstoxFuturesNativeDailyMarketDataSource(access_token, current_instant=current_instant)
         if fetch is None
-        else UpstoxFuturesNativeDailyMarketDataSource(access_token, fetch=fetch)
+        else UpstoxFuturesNativeDailyMarketDataSource(
+            access_token, fetch=fetch, current_instant=current_instant
+        )
     )
     return AcquireFuturesNativeDailyHistoryUseCase(
         NSEFuturesTradingSessionResolver(),

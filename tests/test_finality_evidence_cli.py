@@ -380,3 +380,36 @@ def test_the_canonical_database_is_untouched(tmp_path: Path) -> None:
     assert canonical.read_bytes() == before
     assert sorted(p.name for p in tmp_path.iterdir()) == ["evidence.jsonl", "northstar.sqlite3"]
     assert not any(p.name.endswith(".operations.lock") for p in tmp_path.iterdir())
+
+
+# ---------------------------------------------------------------------------
+# Routing by the venue date of requested_at
+# ---------------------------------------------------------------------------
+
+
+def test_observing_the_venue_date_reads_the_current_day_candle(evidence: Path) -> None:
+    fake = FakeUpstox(_normal_market(), current_day_bar=21)
+    day = _day(21)  # 2026-08-26
+    clock = Clock(
+        datetime.fromisoformat(f"{day}T11:00:00+00:00"),
+        datetime.fromisoformat(f"{day}T11:00:01+00:00"),
+    )
+
+    outcome, _, _ = _observe(evidence, fake=fake, clock=clock)
+
+    assert outcome.code == ExitCode.SUCCESS, outcome.err
+    (record,) = _records(evidence)
+    assert record["candle"]["close"] == str(int(fake.market.close(21)))
+    assert fake.current_day_requests == 1 and fake.candle_requests == []
+    assert clock.reads == 2
+    assert "Candle present: yes" in outcome.out
+
+
+def test_observing_a_past_date_stays_historical(evidence: Path) -> None:
+    fake = FakeUpstox(_normal_market(), current_day_bar=21)
+
+    outcome, _, _ = _observe(evidence, fake=fake)  # the clock is on 2026-09-02
+
+    assert outcome.code == ExitCode.SUCCESS, outcome.err
+    assert fake.current_day_requests == 0
+    assert fake.candle_requests == [(_day(21), _day(21))]
