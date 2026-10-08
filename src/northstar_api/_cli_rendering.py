@@ -17,6 +17,7 @@ from northstar_application.application_services import (
 )
 from northstar_core.foundation.value_objects import Money
 from northstar_core.futures import FuturesContract, FuturesContractEconomics
+from northstar_core.options import OptionContractEconomics
 from northstar_core.paper_trading import FuturesPaperOrder, FuturesPaperPortfolio
 
 POLICY = "built-in directional MVP"
@@ -32,6 +33,14 @@ def economics_lines(economics: FuturesContractEconomics) -> list[str]:
     return [
         f"Contract: {economics.contract}",
         f"Point value: {point_value.amount} {point_value.currency} / quote-point / contract",
+    ]
+
+
+def option_economics_lines(economics: OptionContractEconomics) -> list[str]:
+    point_value = economics.point_value
+    return [
+        f"Contract: {economics.contract}",
+        f"Point value: {point_value.amount} {point_value.currency} / premium-point / contract",
     ]
 
 

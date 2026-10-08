@@ -1,4 +1,4 @@
-"""Single-writer lock for operational mutations of one Futures database.
+"""Single-writer lock for operational mutations of one Northstar operational database.
 
 Paper decisions must be processed one session cutoff at a time, in order. Two
 writers against one database can interleave cutoffs -- one freezing and judging

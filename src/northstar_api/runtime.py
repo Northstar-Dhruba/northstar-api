@@ -33,6 +33,16 @@ present: where data comes from says nothing about where the contract trades.
 K is a fixed composition constant rather than configuration, because a run
 replays every frozen decision under its deterministic order identity, and a K
 that differed between runs could change a past decision's intent.
+
+Option economics
+----------------
+Option contract economics live in the same SQLite file but have their own
+wiring, and DatabaseRuntime and initialize_database are not involved. The
+writable OptionEconomicsRuntime creates only ``option_contract_economics``, and
+only ``options economics set`` builds it, under the operations lock. Reads use
+build_option_economics_lookup, which creates nothing: not the file, not the
+table. A futures-only database therefore acquires the option table only on the
+first option economics write.
 """
 
 from __future__ import annotations
@@ -57,6 +67,7 @@ from northstar_application.application_services import (
     FuturesExpiryFlattenGuard,
     FuturesExpiryFlattenPolicy,
     GetFuturesPaperTradingSnapshotUseCase,
+    GetOptionContractEconomicsUseCase,
     OperatorApprovedFuturesDailyBarFinalityPolicy,
     RunFuturesPaperTradingSessionUseCase,
 )
@@ -70,6 +81,8 @@ from northstar_application.ports import (
     FuturesPaperFillRepository,
     FuturesPaperOrderRepository,
     FuturesTradingSessionResolver,
+    OptionContractEconomicsRepository,
+    OptionContractEconomicsStore,
 )
 from northstar_core.futures import FuturesContract
 from northstar_core.strategy import FuturesAssetAnalysisGenerator
@@ -92,9 +105,12 @@ from northstar_infrastructure.persistence import (
     SQLiteFuturesPaperFillStore,
     SQLiteFuturesPaperOrderRepository,
     SQLiteFuturesPaperOrderStore,
+    SQLiteOptionContractEconomicsRepository,
+    SQLiteOptionContractEconomicsStore,
     initialize_futures_contract_economics_schema,
     initialize_futures_forward_research_record_schema,
     initialize_futures_paper_trading_schema,
+    initialize_option_contract_economics_schema,
 )
 
 from northstar_api.settings import FuturesDailyBarFinalityMode, FuturesSessionOperationSettings
@@ -253,6 +269,64 @@ def build_database_runtime(path: Path) -> DatabaseRuntime:
         expiry_guarded_paper_sessions=MappingProxyType(
             {venue: paper_session(guard()) for venue, guard in _EXPIRY_GUARDS.items()}
         ),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class OptionEconomicsRuntime:
+    """The writable option economics ports and the fail-closed query, over one SQLite file.
+
+    Building it creates the option table, so it serves configuration writes
+    only; read-only commands use build_option_economics_lookup instead.
+    """
+
+    store: OptionContractEconomicsStore
+    repository: OptionContractEconomicsRepository
+    lookup: GetOptionContractEconomicsUseCase
+
+
+def _require_option_database_path(path: Path) -> None:
+    """Refuse a database path that can never be a SQLite file, creating nothing."""
+    if not path.parent.is_dir():
+        raise DatabaseConfigurationError(f"Database directory does not exist: {path.parent}")
+    if path.is_dir():
+        raise DatabaseConfigurationError(f"Database path is a directory: {path}")
+
+
+def initialize_option_economics_database(path: Path) -> None:
+    """Create only the option contract economics table in one SQLite file.
+
+    This is a write: it is for configuration commands, never for reads. The file
+    may already hold futures tables; they are neither created nor touched here.
+    The futures initializer, in turn, never creates this table.
+    """
+    _require_option_database_path(path)
+    try:
+        with closing(sqlite3.connect(path)) as connection:
+            initialize_option_contract_economics_schema(connection)
+    except sqlite3.Error as exc:
+        raise DatabaseConfigurationError(f"Database cannot be opened: {path}") from exc
+
+
+def build_option_economics_lookup(path: Path) -> GetOptionContractEconomicsUseCase:
+    """Wire the fail-closed option economics query read-only, creating nothing.
+
+    Only the path is checked. A database file that does not exist yet, or one
+    without the option table, holds no option economics, so the query fails
+    closed with not-found rather than creating either.
+    """
+    _require_option_database_path(path)
+    return GetOptionContractEconomicsUseCase(SQLiteOptionContractEconomicsRepository(path))
+
+
+def build_option_economics_runtime(path: Path) -> OptionEconomicsRuntime:
+    """Initialize the option economics table and wire its SQLite adapters for writes."""
+    initialize_option_economics_database(path)
+    repository = SQLiteOptionContractEconomicsRepository(path)
+    return OptionEconomicsRuntime(
+        store=SQLiteOptionContractEconomicsStore(path),
+        repository=repository,
+        lookup=GetOptionContractEconomicsUseCase(repository),
     )
 
 
