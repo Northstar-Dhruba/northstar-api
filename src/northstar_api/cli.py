@@ -1,6 +1,7 @@
 """Operational command line for daily futures paper trading.
 
     northstar economics set | show
+    northstar options economics set | show
     northstar market-data sync
     northstar paper run | status
     northstar operations daily
@@ -48,10 +49,11 @@ Exit codes:
                       manual write refused because another writer holds the
                       database's operations lock (nothing was changed)
 
-Every command that mutates the database -- ``economics set``, ``market-data
-sync``, ``paper run`` and ``operations daily`` -- holds that database's single
-operations lock for its whole run. ``operations daily`` treats a held lock as a
-safe skip and exits 0; a manual command refuses with 5.
+Every command that mutates the database -- ``economics set``, ``options
+economics set``, ``market-data sync``, ``paper run`` and ``operations daily`` --
+holds that database's single operations lock for its whole run. ``operations
+daily`` treats a held lock as a safe skip and exits 0; a manual command refuses
+with 5.
     6  PROVIDER       the market-data provider or session calendar failed
 """
 
@@ -85,7 +87,10 @@ from northstar_application.application_services import (
     FuturesPaperPortfolioStrategyConflictError,
     FuturesPaperTradingContractViolationError,
     FuturesPaperTradingSessionResult,
+    GetOptionContractEconomicsUseCase,
     InvalidFuturesPaperFillHistoryError,
+    OptionContractEconomicsContractViolationError,
+    OptionContractEconomicsNotFoundError,
 )
 from northstar_application.ports import (
     FuturesContractEconomicsConflictError,
@@ -97,6 +102,7 @@ from northstar_application.ports import (
     FuturesPaperOrderConflictError,
     FuturesSessionResolutionError,
     FuturesTradingSession,
+    OptionContractEconomicsConflictError,
 )
 from northstar_core.derivatives import ExpirationDate
 from northstar_core.foundation.value_objects import (
@@ -111,6 +117,14 @@ from northstar_core.futures import (
     FuturesContractEconomics,
     FuturesPointValue,
     FuturesProductReference,
+)
+from northstar_core.options import (
+    OptionContract,
+    OptionContractEconomics,
+    OptionPointValue,
+    OptionProductReference,
+    OptionRight,
+    OptionStrike,
 )
 from northstar_core.paper_trading import FuturesContractCount, PaperPortfolioIdentity
 from northstar_core.strategy import StrategyIdentity
@@ -130,6 +144,7 @@ from northstar_infrastructure.persistence import (
     FuturesContractEconomicsStorageError,
     FuturesForwardResearchStorageError,
     FuturesPaperTradingStorageError,
+    OptionContractEconomicsStorageError,
 )
 
 from northstar_api import _cli_rendering as render
@@ -152,9 +167,12 @@ from northstar_api.runtime import (
     DatabaseConfigurationError,
     DatabaseRuntime,
     FuturesDailyAcquisition,
+    OptionEconomicsRuntime,
     build_daily_bar_finality_policy,
     build_database_runtime,
     build_market_sync_runtime,
+    build_option_economics_lookup,
+    build_option_economics_runtime,
     build_upstox_market_sync_runtime,
 )
 from northstar_api.settings import (
@@ -223,6 +241,9 @@ _STATE_ERRORS: tuple[type[Exception], ...] = (
     FuturesForwardResearchStorageError,
     FuturesPaperTradingStorageError,
     FuturesContractEconomicsStorageError,
+    OptionContractEconomicsConflictError,
+    OptionContractEconomicsContractViolationError,
+    OptionContractEconomicsStorageError,
 )
 _PROVIDER_ERRORS: tuple[type[Exception], ...] = (
     DatabentoFuturesHistoricalMarketDataSourceError,
@@ -273,6 +294,13 @@ class _Context:
     clock: Clock = _utc_now
     upstox_candle_evidence: Callable[[str, Clock], UpstoxDailyCandleEvidenceCollector] = (
         _upstox_candle_evidence
+    )
+    option_economics_runtime: Callable[[Path], OptionEconomicsRuntime] = (
+        build_option_economics_runtime
+    )
+    # Read-only: builds the query without creating the file or the option table.
+    option_economics_lookup: Callable[[Path], GetOptionContractEconomicsUseCase] = (
+        build_option_economics_lookup
     )
     # Secrets read by this invocation; every output line is scrubbed of them.
     secrets: list[str] = field(default_factory=list)
@@ -385,6 +413,69 @@ def _economics_show(args: argparse.Namespace, context: _Context) -> ExitCode:
             "Use 'northstar economics set' to configure them.",
         )
     context.write(render.economics_lines(economics))
+    return ExitCode.SUCCESS
+
+
+# ---------------------------------------------------------------------------
+# options economics
+# ---------------------------------------------------------------------------
+
+
+def _strike(text: str) -> OptionStrike:
+    return OptionStrike(_decimal(text))
+
+
+def _option_contract(args: argparse.Namespace) -> OptionContract:
+    """Parse one exact option contract; the right is exactly CALL or PUT, never an alias."""
+    product = OptionProductReference(
+        _parse("product", args.product, Symbol), _parse("exchange", args.exchange, ExchangeCode)
+    )
+    return OptionContract(
+        product,
+        _parse("expiration", args.expiration, ExpirationDate),
+        _parse("strike", args.strike, _strike),
+        _parse("right (exactly CALL or PUT)", args.right, OptionRight),
+    )
+
+
+def _options_economics_set(args: argparse.Namespace, context: _Context) -> ExitCode:
+    contract = _option_contract(args)
+    amount = _parse("point value", args.point_value, _decimal)
+    currency = _parse("currency", args.currency, Currency)
+    point_value = _parse(
+        "point value", args.point_value, lambda _: OptionPointValue(amount, currency)
+    )
+    economics = OptionContractEconomics(contract, point_value)
+
+    with DatabaseOperationsLock(_database(args)):
+        accepted = context.option_economics_runtime(_database(args)).store.store((economics,))
+    if isinstance(accepted, bool) or accepted != 1:
+        raise CommandError(
+            ExitCode.STATE, f"Option economics store accepted {accepted!r} values, expected 1."
+        )
+    context.write(
+        [
+            "OPTION ECONOMICS: READY",
+            *render.option_economics_lines(economics),
+            "Stored, or already stored with identical values.",
+        ]
+    )
+    return ExitCode.SUCCESS
+
+
+def _options_economics_show(args: argparse.Namespace, context: _Context) -> ExitCode:
+    contract = _option_contract(args)
+    # Read-only: no operations lock, no schema initialization, no file creation.
+    lookup = context.option_economics_lookup(_database(args))
+    try:
+        economics = lookup.execute(contract)
+    except OptionContractEconomicsNotFoundError as error:
+        raise CommandError(
+            ExitCode.DATA,
+            f"Option contract economics not configured for {error.contract}. "
+            "Use 'northstar options economics set' to configure them.",
+        ) from error
+    context.write(render.option_economics_lines(economics))
     return ExitCode.SUCCESS
 
 
@@ -1119,6 +1210,18 @@ def _add_contract(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--expiration", required=True, help="contract expiration, YYYY-MM-DD")
 
 
+def _add_option_contract(parser: argparse.ArgumentParser) -> None:
+    _add_contract(parser)
+    parser.add_argument(
+        "--strike",
+        required=True,
+        help="option strike in the underlying's quotation convention, e.g. 25000",
+    )
+    parser.add_argument(
+        "--right", required=True, help="option right, exactly CALL or PUT (not CE or PE)"
+    )
+
+
 def _add_paper_identity(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--strategy",
@@ -1138,7 +1241,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="northstar", description="Northstar daily futures paper trading."
     )
     groups = parser.add_subparsers(
-        dest="group", required=True, metavar="{economics,market-data,paper,operations}"
+        dest="group", required=True, metavar="{economics,options,market-data,paper,operations}"
     )
 
     economics = groups.add_parser("economics", help="configure the economics of one dated contract")
@@ -1166,6 +1269,36 @@ def build_parser() -> argparse.ArgumentParser:
     _add_database(show_parser)
     _add_contract(show_parser)
     show_parser.set_defaults(handler=_economics_show)
+
+    options = groups.add_parser("options", help="configure facts about exact option contracts")
+    option_groups = options.add_subparsers(dest="options_group", required=True)
+    option_economics = option_groups.add_parser(
+        "economics", help="configure the economics of one exact option contract"
+    )
+    option_economics_commands = option_economics.add_subparsers(dest="command", required=True)
+    option_set_parser = option_economics_commands.add_parser(
+        "set", help="store one exact option contract's economics once"
+    )
+    _add_database(option_set_parser)
+    _add_option_contract(option_set_parser)
+    option_set_parser.add_argument(
+        "--point-value",
+        required=True,
+        help=(
+            "currency per 1.0 premium point per option contract, for this exact contract "
+            "only, e.g. 65 for a NIFTY lot of 65"
+        ),
+    )
+    option_set_parser.add_argument(
+        "--currency", required=True, help="settlement currency, e.g. INR"
+    )
+    option_set_parser.set_defaults(handler=_options_economics_set)
+    option_show_parser = option_economics_commands.add_parser(
+        "show", help="show one exact option contract's stored economics"
+    )
+    _add_database(option_show_parser)
+    _add_option_contract(option_show_parser)
+    option_show_parser.set_defaults(handler=_options_economics_show)
 
     market = groups.add_parser("market-data", help="sync completed daily sessions")
     market_commands = market.add_subparsers(dest="command", required=True)
@@ -1318,6 +1451,8 @@ def _classify(error: Exception) -> tuple[ExitCode, str]:
         error, FuturesTradingSessionInProgressError | FuturesContractEconomicsNotFoundError
     ):
         return ExitCode.DATA, str(error)
+    if isinstance(error, OptionContractEconomicsNotFoundError):
+        return ExitCode.DATA, str(error)
     if isinstance(error, FuturesExpiryWindowError):
         # The contract and the session calendar disagree; a data fact, not a crash.
         return ExitCode.DATA, f"{type(error).__name__}: {error}"
@@ -1348,6 +1483,12 @@ def main(
     upstox_candle_evidence: Callable[
         [str, Clock], UpstoxDailyCandleEvidenceCollector
     ] = _upstox_candle_evidence,
+    option_economics_runtime: Callable[
+        [Path], OptionEconomicsRuntime
+    ] = build_option_economics_runtime,
+    option_economics_lookup: Callable[
+        [Path], GetOptionContractEconomicsUseCase
+    ] = build_option_economics_lookup,
 ) -> int:
     """Run one command and return its exit code."""
     out = stdout if stdout is not None else sys.stdout
@@ -1368,6 +1509,8 @@ def main(
         upstox_market_sync_runtime=upstox_market_sync_runtime,
         clock=clock,
         upstox_candle_evidence=upstox_candle_evidence,
+        option_economics_runtime=option_economics_runtime,
+        option_economics_lookup=option_economics_lookup,
     )
     try:
         return args.handler(args, context)
