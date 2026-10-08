@@ -67,6 +67,14 @@ open-interest capture the composite store consumes, so the open interest stored
 is exactly that of the candles the bars were built from. Building the path
 checks the database path, creates nothing and reads no clock; the composite
 store creates the option market-data tables inside its first write transaction.
+
+Option chain snapshots
+----------------------
+``options chain show`` is read-only. build_option_chain_runtime wires the NSE
+option session resolver and two read-only SQLite repositories -- the contracts
+the stored Upstox listings made known by an instant, and one expiration's daily
+bars at one exact instant -- into BuildOptionChainSnapshotUseCase. Building it
+checks the path and creates nothing: no file, no table, no lock.
 """
 
 from __future__ import annotations
@@ -86,6 +94,7 @@ from northstar_application.application_services import (
     AcquireOptionNativeDailyHistoryUseCase,
     AggregateFuturesDailySessionBarUseCase,
     BuildFuturesPaperTradingValuationUseCase,
+    BuildOptionChainSnapshotUseCase,
     CalculateFuturesAnalysisUseCase,
     DisabledFuturesDailyBarFinalityPolicy,
     FuturesDailyAcquisitionResult,
@@ -119,7 +128,9 @@ from northstar_infrastructure.market_data import (
     NSEOptionTradingSessionResolver,
     SQLiteFuturesHistoricalMarketDataRepository,
     SQLiteFuturesHistoricalMarketDataStore,
+    SQLiteOptionChainDailyBarRepository,
     SQLiteOptionDailyAcquisitionStore,
+    SQLiteOptionListedContractRepository,
     SQLiteOptionListingRepository,
     SQLiteOptionListingStore,
     UpstoxFuturesNativeDailyMarketDataSource,
@@ -399,6 +410,21 @@ def build_option_listing_lookup(path: Path) -> SQLiteOptionListingRepository:
     """
     _require_option_database_path(path)
     return SQLiteOptionListingRepository(path)
+
+
+def build_option_chain_runtime(path: Path) -> BuildOptionChainSnapshotUseCase:
+    """Wire the read-only point-in-time option chain query, creating nothing.
+
+    Only the path is checked. A database file that does not exist yet, or one
+    without the listing or option bar tables, holds no listings and no bars;
+    the query then fails closed because no listing is known.
+    """
+    _require_option_database_path(path)
+    return BuildOptionChainSnapshotUseCase(
+        NSEOptionTradingSessionResolver(),
+        SQLiteOptionListedContractRepository(path, provider=UPSTOX_PROVIDER),
+        SQLiteOptionChainDailyBarRepository(path),
+    )
 
 
 def build_option_market_data_runtime(

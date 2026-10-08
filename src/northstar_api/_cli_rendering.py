@@ -20,7 +20,14 @@ from northstar_application.application_services import (
 )
 from northstar_core.foundation.value_objects import Money
 from northstar_core.futures import FuturesContract, FuturesContractEconomics
-from northstar_core.options import OptionContract, OptionContractEconomics, OptionProductReference
+from northstar_core.options import (
+    OptionChainEntry,
+    OptionChainSnapshot,
+    OptionContract,
+    OptionContractEconomics,
+    OptionProductReference,
+    OptionRight,
+)
 from northstar_core.paper_trading import FuturesPaperOrder, FuturesPaperPortfolio
 from northstar_infrastructure.market_data import (
     StoredOptionProviderListing,
@@ -110,6 +117,40 @@ def option_market_data_sync_lines(result: OptionDailyAcquisitionResult) -> list[
         f"Provider open-interest records persisted: {result.daily_bar_count} "
         "(raw provider values, not normalized)",
         "Finality: not assessed",
+    ]
+
+
+def _chain_cell(entry: OptionChainEntry | None) -> str:
+    if entry is None:
+        return "no known listing"
+    if entry.daily_bar is None:
+        return "no daily bar"
+    return f"C={entry.daily_bar.close} V={entry.daily_bar.volume}"
+
+
+def option_chain_lines(snapshot: OptionChainSnapshot, trading_date: date) -> list[str]:
+    """Render one chain, a strike per row; an absent bar is never called a no-trade session."""
+    rows: dict[str, dict[OptionRight, OptionChainEntry]] = {}
+    for entry in snapshot.entries:
+        rows.setdefault(str(entry.contract.strike), {})[entry.contract.right] = entry
+    table = [
+        (strike, _chain_cell(row.get(OptionRight.CALL)), _chain_cell(row.get(OptionRight.PUT)))
+        for strike, row in rows.items()
+    ]
+    strike_width = max(len("STRIKE"), *(len(strike) for strike, _, _ in table)) + 4
+    call_width = max(len("CALL"), *(len(call) for _, call, _ in table)) + 4
+    observed = sum(1 for entry in snapshot.entries if entry.daily_bar is not None)
+    return [
+        f"OPTION CHAIN: {snapshot.product} {snapshot.expiration_date}",
+        f"Trading date: {trading_date.isoformat()}",
+        f"As of: {snapshot.as_of} (session close)",
+        f"Listed contracts known by as-of: {len(snapshot.entries)}",
+        f"Strikes: {len(rows)}",
+        f"Contracts with a daily bar: {observed}",
+        f"Contracts with no daily bar: {len(snapshot.entries) - observed}",
+        "",
+        f"{'STRIKE':<{strike_width}}{'CALL':<{call_width}}PUT",
+        *(f"{strike:<{strike_width}}{call:<{call_width}}{put}" for strike, call, put in table),
     ]
 
 
