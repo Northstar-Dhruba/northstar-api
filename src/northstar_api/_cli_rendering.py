@@ -8,16 +8,19 @@ combined.
 
 from __future__ import annotations
 
+from datetime import date
+
 from northstar_application.application_services import (
     FuturesContractPnl,
     FuturesPaperTradingDecisionResult,
     FuturesPaperTradingReport,
     FuturesPaperTradingSessionResult,
     FuturesPaperTradingValuation,
+    OptionDailyAcquisitionResult,
 )
 from northstar_core.foundation.value_objects import Money
 from northstar_core.futures import FuturesContract, FuturesContractEconomics
-from northstar_core.options import OptionContractEconomics, OptionProductReference
+from northstar_core.options import OptionContract, OptionContractEconomics, OptionProductReference
 from northstar_core.paper_trading import FuturesPaperOrder, FuturesPaperPortfolio
 from northstar_infrastructure.market_data import (
     StoredOptionProviderListing,
@@ -72,6 +75,41 @@ def option_instrument_lines(listing: StoredOptionProviderListing) -> list[str]:
         f"Exchange lot size: {listing.exchange_lot_size}",
         f"Established snapshot: {listing.established_snapshot_sha256}",
         f"Established at: {listing.established_at}",
+    ]
+
+
+def option_market_data_sync_header_lines(
+    provider: str, contract: OptionContract, start: date, end: date
+) -> list[str]:
+    return [
+        "OPTIONS MARKET DATA SYNC",
+        f"Provider: {provider}",
+        f"Contract: {contract}",
+        f"Date range: {start} .. {end} (trading dates, historical endpoint only)",
+    ]
+
+
+def option_market_data_sync_lines(result: OptionDailyAcquisitionResult) -> list[str]:
+    """Summarize one option sync; a missing candle is never called a no-trade session.
+
+    The composite store persists exactly one raw open-interest record beside
+    each bar or nothing at all, so the open-interest count is the bar count.
+    """
+    missing = result.missing_trading_dates
+    lines = [
+        "SYNC: COMPLETED",
+        f"Sessions in range: {result.session_count}",
+        f"Sessions with a persisted daily bar: {result.daily_bar_count} "
+        "(identical bars already stored count as persisted)",
+        f"Sessions without a provider candle: {len(missing)}",
+    ]
+    if missing:
+        lines.append(f"Missing trading dates: {', '.join(day.isoformat() for day in missing)}")
+    return [
+        *lines,
+        f"Provider open-interest records persisted: {result.daily_bar_count} "
+        "(raw provider values, not normalized)",
+        "Finality: not assessed",
     ]
 
 
