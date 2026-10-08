@@ -3,6 +3,7 @@
     northstar economics set | show
     northstar options economics set | show
     northstar options instruments sync | show
+    northstar options market-data sync
     northstar market-data sync
     northstar paper run | status
     northstar operations daily
@@ -19,6 +20,16 @@ it reads it exactly once: when the public Upstox instrument master has been
 received, to record when Northstar observed that snapshot. It needs no secret.
 ``options instruments show`` reads no clock, contacts no provider and creates
 nothing.
+
+``options market-data sync`` acquires one exact option contract's historical
+daily candles from Upstox. It reads UPSTOX_ANALYTICS_TOKEN and nothing else from
+the environment, reads no clock and asks only Upstox's historical endpoint, so
+it never claims a candle is final. The contract must already have a persisted
+listing from ``options instruments sync``; the live master is never consulted.
+A resolved session for which Upstox returns no candle is reported as a session
+without a provider candle -- never as a no-trade session -- and nothing is stored
+for it. The bars and their raw provider open interest are stored together or
+not at all.
 
 ``operations daily`` is the unattended entry point. It reads its configuration
 and the secret from the environment, reads the wall clock exactly once, syncs
@@ -48,7 +59,10 @@ Exit codes:
     3  CONFIGURATION  missing API key or settings, or a database that cannot be opened
     4  DATA           a session not yet complete, no persisted history to extend,
                       a contract whose expiry window the session calendar cannot
-                      place, or contract economics not configured; for ``paper run`` and
+                      place, or contract economics not configured; for ``options
+                      market-data sync``, no persisted option listing, a provider
+                      candle on a date that is not an option session, or a range
+                      the option session reference cannot resolve; for ``paper run`` and
                       ``operations daily`` this means the paper session completed
                       and was persisted but P&L was unavailable
     5  STATE          an immutable conflict, a mixed-strategy portfolio, a
@@ -57,11 +71,15 @@ Exit codes:
                       database's operations lock (nothing was changed)
 
 Every command that mutates the database -- ``economics set``, ``options
-economics set``, ``options instruments sync``, ``market-data sync``, ``paper
-run`` and ``operations daily`` -- holds that database's single operations lock
-for its whole run. ``operations daily`` treats a held lock as a safe skip and
-exits 0; a manual command refuses with 5.
+economics set``, ``options instruments sync``, ``options market-data sync``,
+``market-data sync``, ``paper run`` and ``operations daily`` -- holds that
+database's single operations lock for its whole run. ``operations daily``
+treats a held lock as a safe skip and exits 0; a manual command refuses with 5.
     6  PROVIDER       the market-data provider or session calendar failed
+
+``options market-data sync`` also exits 1 if the open interest a source
+captured does not correspond exactly to the bars being stored: a wiring defect,
+never a data gap, and nothing is stored.
 """
 
 from __future__ import annotations
@@ -98,6 +116,9 @@ from northstar_application.application_services import (
     InvalidFuturesPaperFillHistoryError,
     OptionContractEconomicsContractViolationError,
     OptionContractEconomicsNotFoundError,
+    OptionDailyAcquisitionResult,
+    OptionDailySessionCoverageError,
+    OptionHistoricalDataContractViolationError,
 )
 from northstar_application.ports import (
     FuturesContractEconomicsConflictError,
@@ -110,6 +131,9 @@ from northstar_application.ports import (
     FuturesSessionResolutionError,
     FuturesTradingSession,
     OptionContractEconomicsConflictError,
+    OptionDailyAcquisitionQuery,
+    OptionHistoricalMarketDataConflictError,
+    OptionTradingSessionResolutionError,
 )
 from northstar_core.derivatives import ExpirationDate
 from northstar_core.foundation.value_objects import (
@@ -142,8 +166,13 @@ from northstar_infrastructure.market_data import (
     FuturesHistoricalStorageError,
     FuturesTradingSessionInProgressError,
     NSEFuturesTradingSessionResolver,
+    OptionHistoricalStorageError,
     OptionListingConflictError,
     OptionListingStorageError,
+    OptionOpenInterestCaptureError,
+    OptionOpenInterestConflictError,
+    OptionOpenInterestStorageError,
+    OptionProviderListingNotStoredError,
     SQLiteOptionListingRepository,
     UpstoxCandleEvidenceLog,
     UpstoxCandleEvidenceLogError,
@@ -190,6 +219,7 @@ from northstar_api.runtime import (
     build_option_economics_runtime,
     build_option_instruments_runtime,
     build_option_listing_lookup,
+    build_option_market_data_runtime,
     build_upstox_market_sync_runtime,
 )
 from northstar_api.settings import (
@@ -287,6 +317,15 @@ class UpstoxAcquisitionFactory(Protocol):
 DailySyncRuntime = Callable[[Path, str, Clock], AcquireFuturesDailyHistoryUseCase]
 
 
+class OptionDailyAcquisition(Protocol):
+    """The option acquisition ``options market-data sync`` executes."""
+
+    def execute(self, query: OptionDailyAcquisitionQuery) -> OptionDailyAcquisitionResult: ...
+
+
+OptionMarketDataRuntime = Callable[[Path, str], OptionDailyAcquisition]
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -328,6 +367,7 @@ class _Context:
     option_listing_lookup: Callable[[Path], SQLiteOptionListingRepository] = (
         build_option_listing_lookup
     )
+    option_market_data_runtime: OptionMarketDataRuntime = build_option_market_data_runtime
     # Secrets read by this invocation; every output line is scrubbed of them.
     secrets: list[str] = field(default_factory=list)
 
@@ -557,6 +597,86 @@ def _options_instruments_show(args: argparse.Namespace, context: _Context) -> Ex
             "Use 'northstar options instruments sync' while the contract is listed.",
         )
     context.write(render.option_instrument_lines(listing))
+    return ExitCode.SUCCESS
+
+
+# ---------------------------------------------------------------------------
+# options market-data
+# ---------------------------------------------------------------------------
+
+# The composite store writes bars and open interest in one transaction, and
+# nothing is written before the whole range has been validated.
+_OPTION_SYNC_STOPPED = "Sync stopped. Nothing from this range was stored."
+_OPTION_STATE_ERRORS: tuple[type[Exception], ...] = (
+    OptionHistoricalMarketDataConflictError,
+    OptionOpenInterestConflictError,
+    OptionHistoricalStorageError,
+    OptionOpenInterestStorageError,
+    OptionListingStorageError,
+)
+
+
+def _option_sync_failure(code: ExitCode, error: Exception) -> CommandError:
+    message = f"{type(error).__name__}: {error}"
+    if code is ExitCode.STATE and _database_busy(error):
+        message += " (database busy: another process holds the SQLite write lock; retry later)"
+    return CommandError(code, f"{message}\n{_OPTION_SYNC_STOPPED}")
+
+
+def _acquire_options(
+    acquisition: OptionDailyAcquisition, query: OptionDailyAcquisitionQuery
+) -> OptionDailyAcquisitionResult:
+    try:
+        return acquisition.execute(query)
+    except (
+        OptionProviderListingNotStoredError,
+        OptionDailySessionCoverageError,
+        OptionTradingSessionResolutionError,
+    ) as error:
+        # Northstar's own reference data cannot answer the request: no stored
+        # listing, a candle on a date that is not an option session, or a range
+        # the option session reference does not cover.
+        raise _option_sync_failure(ExitCode.DATA, error) from error
+    except (UpstoxMarketDataSourceError, OptionHistoricalDataContractViolationError) as error:
+        raise _option_sync_failure(ExitCode.PROVIDER, error) from error
+    except _OPTION_STATE_ERRORS as error:
+        raise _option_sync_failure(ExitCode.STATE, error) from error
+    except OptionOpenInterestCaptureError as error:
+        raise _option_sync_failure(ExitCode.INTERNAL, error) from error
+
+
+def _options_market_data_sync(args: argparse.Namespace, context: _Context) -> ExitCode:
+    contract = _option_contract(args)
+    _listing_product(contract.product)
+    start = _parse("start date", args.start, _trading_date)
+    end = _parse("end date", args.end, _trading_date)
+    query = _parse(
+        "date range",
+        f"{args.start}..{args.end}",
+        lambda _: OptionDailyAcquisitionQuery(contract, start, end),
+    )
+    expiration = date.fromisoformat(contract.expiration_date.value)
+    if end > expiration:
+        raise CommandError(
+            ExitCode.INPUT,
+            f"Invalid end date {args.end!r}: it is after the contract's expiration "
+            f"{expiration.isoformat()}.",
+        )
+    database = _database(args)
+
+    with DatabaseOperationsLock(database):
+        token = _secret(context, UPSTOX_TOKEN_VARIABLE, "Upstox", "options market-data sync")
+        if any(character in token for character in "\r\n"):
+            raise CommandError(
+                ExitCode.CONFIGURATION, f"{UPSTOX_TOKEN_VARIABLE} must be a single line."
+            )
+        acquisition = context.option_market_data_runtime(database, token)
+        context.write(
+            render.option_market_data_sync_header_lines(UPSTOX_PROVIDER, contract, start, end)
+        )
+        result = _acquire_options(acquisition, query)
+
+    context.write(render.option_market_data_sync_lines(result))
     return ExitCode.SUCCESS
 
 
@@ -1402,6 +1522,28 @@ def build_parser() -> argparse.ArgumentParser:
     _add_option_contract(instrument_show_parser)
     instrument_show_parser.set_defaults(handler=_options_instruments_show)
 
+    option_market = option_groups.add_parser(
+        "market-data", help="acquire daily candles of one exact option contract"
+    )
+    option_market_commands = option_market.add_subparsers(dest="command", required=True)
+    option_sync_parser = option_market_commands.add_parser(
+        "sync",
+        help=(
+            "acquire one exact option contract's historical Upstox daily candles and raw "
+            f"open interest (needs {UPSTOX_TOKEN_VARIABLE} and a persisted listing from "
+            "'options instruments sync'; historical endpoint only, no finality claim)"
+        ),
+    )
+    _add_database(option_sync_parser)
+    _add_option_contract(option_sync_parser)
+    option_sync_parser.add_argument("--start", required=True, help="first trading date, YYYY-MM-DD")
+    option_sync_parser.add_argument(
+        "--end",
+        required=True,
+        help="last trading date, YYYY-MM-DD, no later than the contract's expiration",
+    )
+    option_sync_parser.set_defaults(handler=_options_market_data_sync)
+
     market = groups.add_parser("market-data", help="sync completed daily sessions")
     market_commands = market.add_subparsers(dest="command", required=True)
     sync_parser = market_commands.add_parser(
@@ -1597,6 +1739,7 @@ def main(
     option_listing_lookup: Callable[
         [Path], SQLiteOptionListingRepository
     ] = build_option_listing_lookup,
+    option_market_data_runtime: OptionMarketDataRuntime = build_option_market_data_runtime,
 ) -> int:
     """Run one command and return its exit code."""
     out = stdout if stdout is not None else sys.stdout
@@ -1621,6 +1764,7 @@ def main(
         option_economics_lookup=option_economics_lookup,
         option_instruments_runtime=option_instruments_runtime,
         option_listing_lookup=option_listing_lookup,
+        option_market_data_runtime=option_market_data_runtime,
     )
     try:
         return args.handler(args, context)

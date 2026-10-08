@@ -52,6 +52,21 @@ file in two tables of their own. OptionInstrumentRuntime serves only
 the listing tables just before its first write. ``options instruments show``
 uses build_option_listing_lookup, which opens the file read-only and creates
 nothing.
+
+Option daily market data
+------------------------
+``options market-data sync`` gets its own acquisition path, again apart from
+DatabaseRuntime and initialize_database:
+
+    persisted Upstox listing -> historical native daily candles
+        -> NSE option sessions -> observed-subset coverage
+        -> bars + raw provider open interest in one transaction
+
+One Upstox source instance serves twice: as the Application source, and as the
+open-interest capture the composite store consumes, so the open interest stored
+is exactly that of the candles the bars were built from. Building the path
+checks the database path, creates nothing and reads no clock; the composite
+store creates the option market-data tables inside its first write transaction.
 """
 
 from __future__ import annotations
@@ -68,6 +83,7 @@ from typing import Protocol
 from northstar_application.application_services import (
     AcquireFuturesDailyHistoryUseCase,
     AcquireFuturesNativeDailyHistoryUseCase,
+    AcquireOptionNativeDailyHistoryUseCase,
     AggregateFuturesDailySessionBarUseCase,
     BuildFuturesPaperTradingValuationUseCase,
     CalculateFuturesAnalysisUseCase,
@@ -96,15 +112,19 @@ from northstar_application.ports import (
 from northstar_core.futures import FuturesContract
 from northstar_core.strategy import FuturesAssetAnalysisGenerator
 from northstar_infrastructure.market_data import (
+    UPSTOX_PROVIDER,
     DatabentoFuturesHistoricalMarketDataSource,
     ExchangeCalendarFuturesTradingSessionResolver,
     NSEFuturesTradingSessionResolver,
+    NSEOptionTradingSessionResolver,
     SQLiteFuturesHistoricalMarketDataRepository,
     SQLiteFuturesHistoricalMarketDataStore,
+    SQLiteOptionDailyAcquisitionStore,
     SQLiteOptionListingRepository,
     SQLiteOptionListingStore,
     UpstoxFuturesNativeDailyMarketDataSource,
     UpstoxOptionInstrumentMaster,
+    UpstoxOptionNativeDailyMarketDataSource,
     initialize_futures_market_data_schema,
 )
 from northstar_infrastructure.market_data.upstox_http import UpstoxFetch
@@ -379,6 +399,30 @@ def build_option_listing_lookup(path: Path) -> SQLiteOptionListingRepository:
     """
     _require_option_database_path(path)
     return SQLiteOptionListingRepository(path)
+
+
+def build_option_market_data_runtime(
+    path: Path, access_token: str, *, fetch: UpstoxFetch | None = None
+) -> AcquireOptionNativeDailyHistoryUseCase:
+    """Wire historical Upstox option daily acquisition into one database.
+
+    Only the path is checked; nothing is created and no clock is read. The
+    source resolves each contract through the persisted listing reference,
+    read-only, and never through the live instrument master. The same source
+    instance is the open-interest capture of the composite store, which writes
+    the bars and their raw open interest together or not at all.
+
+    ``fetch`` replaces the source's HTTP transport, for tests only.
+    """
+    _require_option_database_path(path)
+    listings = SQLiteOptionListingRepository(path)
+    source = (
+        UpstoxOptionNativeDailyMarketDataSource(access_token, listings=listings)
+        if fetch is None
+        else UpstoxOptionNativeDailyMarketDataSource(access_token, listings=listings, fetch=fetch)
+    )
+    store = SQLiteOptionDailyAcquisitionStore(path, open_interest=source, provider=UPSTOX_PROVIDER)
+    return AcquireOptionNativeDailyHistoryUseCase(NSEOptionTradingSessionResolver(), source, store)
 
 
 def build_market_sync_runtime(
