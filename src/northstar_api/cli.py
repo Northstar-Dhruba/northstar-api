@@ -4,6 +4,7 @@
     northstar options economics set | show
     northstar options instruments sync | show
     northstar options market-data sync
+    northstar options chain show
     northstar market-data sync
     northstar paper run | status
     northstar operations daily
@@ -30,6 +31,13 @@ A resolved session for which Upstox returns no candle is reported as a session
 without a provider candle -- never as a no-trade session -- and nothing is stored
 for it. The bars and their raw provider open interest are stored together or
 not at all.
+
+``options chain show`` is read-only. It reconstructs one expiration's chain at
+one trading date's option session close from what is stored: the contracts
+whose listing Northstar had observed by that close, each with its daily bar
+stamped exactly at that close, or "no daily bar". A stored bar never makes a
+contract a member. It reads no environment, no clock and no network, takes no
+lock and creates nothing; it selects no contract.
 
 ``operations daily`` is the unattended entry point. It reads its configuration
 and the secret from the environment, reads the wall clock exactly once, syncs
@@ -102,6 +110,7 @@ from typing import Protocol, TextIO
 
 from northstar_application.application_services import (
     AcquireFuturesDailyHistoryUseCase,
+    BuildOptionChainSnapshotUseCase,
     ForwardResearchContractViolationError,
     FuturesContractEconomicsContractViolationError,
     FuturesContractEconomicsNotFoundError,
@@ -114,6 +123,10 @@ from northstar_application.application_services import (
     FuturesPaperTradingSessionResult,
     GetOptionContractEconomicsUseCase,
     InvalidFuturesPaperFillHistoryError,
+    OptionChainContractViolationError,
+    OptionChainListingNotKnownError,
+    OptionChainSessionNotFoundError,
+    OptionChainSnapshotQuery,
     OptionContractEconomicsContractViolationError,
     OptionContractEconomicsNotFoundError,
     OptionDailyAcquisitionResult,
@@ -150,6 +163,7 @@ from northstar_core.futures import (
     FuturesProductReference,
 )
 from northstar_core.options import (
+    OptionChainSnapshot,
     OptionContract,
     OptionContractEconomics,
     OptionPointValue,
@@ -215,6 +229,7 @@ from northstar_api.runtime import (
     build_daily_bar_finality_policy,
     build_database_runtime,
     build_market_sync_runtime,
+    build_option_chain_runtime,
     build_option_economics_lookup,
     build_option_economics_runtime,
     build_option_instruments_runtime,
@@ -368,6 +383,10 @@ class _Context:
         build_option_listing_lookup
     )
     option_market_data_runtime: OptionMarketDataRuntime = build_option_market_data_runtime
+    # Read-only: builds the chain query without creating the file or any table.
+    option_chain_runtime: Callable[[Path], BuildOptionChainSnapshotUseCase] = (
+        build_option_chain_runtime
+    )
     # Secrets read by this invocation; every output line is scrubbed of them.
     secrets: list[str] = field(default_factory=list)
 
@@ -597,6 +616,51 @@ def _options_instruments_show(args: argparse.Namespace, context: _Context) -> Ex
             "Use 'northstar options instruments sync' while the contract is listed.",
         )
     context.write(render.option_instrument_lines(listing))
+    return ExitCode.SUCCESS
+
+
+# ---------------------------------------------------------------------------
+# options chain
+# ---------------------------------------------------------------------------
+
+
+def _build_chain(
+    chain: BuildOptionChainSnapshotUseCase, query: OptionChainSnapshotQuery
+) -> OptionChainSnapshot:
+    try:
+        return chain.execute(query)
+    except OptionChainSessionNotFoundError as error:
+        raise CommandError(ExitCode.INPUT, f"{type(error).__name__}: {error}") from error
+    except (OptionChainListingNotKnownError, OptionTradingSessionResolutionError) as error:
+        # Northstar's own reference data cannot answer: no listing observed by
+        # the close, or a date the option session reference does not cover.
+        raise CommandError(ExitCode.DATA, f"{type(error).__name__}: {error}") from error
+    except (OptionListingStorageError, OptionHistoricalStorageError) as error:
+        message = f"{type(error).__name__}: {error}"
+        if _database_busy(error):
+            message += " (database busy: another process holds the SQLite write lock; retry later)"
+        raise CommandError(ExitCode.STATE, message) from error
+    except OptionChainContractViolationError as error:
+        raise CommandError(ExitCode.INTERNAL, f"{type(error).__name__}: {error}") from error
+
+
+def _options_chain_show(args: argparse.Namespace, context: _Context) -> ExitCode:
+    product = _listing_product(
+        OptionProductReference(
+            _parse("product", args.product, Symbol),
+            _parse("exchange", args.exchange, ExchangeCode),
+        )
+    )
+    expiration = _parse("expiration", args.expiration, ExpirationDate)
+    trading_date = _parse("trading date", args.trading_date, _trading_date)
+    query = _parse(
+        "chain request",
+        f"{args.expiration} on {args.trading_date}",
+        lambda _: OptionChainSnapshotQuery(product, expiration, trading_date),
+    )
+    # Read-only: no lock, no clock, no network, no token, no file or schema creation.
+    snapshot = _build_chain(context.option_chain_runtime(_database(args)), query)
+    context.write(render.option_chain_lines(snapshot, trading_date))
     return ExitCode.SUCCESS
 
 
@@ -1544,6 +1608,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     option_sync_parser.set_defaults(handler=_options_market_data_sync)
 
+    option_chain = option_groups.add_parser(
+        "chain", help="inspect one option expiration's point-in-time chain"
+    )
+    option_chain_commands = option_chain.add_subparsers(dest="command", required=True)
+    chain_show_parser = option_chain_commands.add_parser(
+        "show",
+        help=(
+            "show one expiration's listed contracts known by a trading date's session close, "
+            "with their daily bars at that close (read-only; no token, no network)"
+        ),
+    )
+    _add_database(chain_show_parser)
+    _add_contract(chain_show_parser)
+    chain_show_parser.add_argument(
+        "--trading-date", required=True, help="option trading session date, YYYY-MM-DD"
+    )
+    chain_show_parser.set_defaults(handler=_options_chain_show)
+
     market = groups.add_parser("market-data", help="sync completed daily sessions")
     market_commands = market.add_subparsers(dest="command", required=True)
     sync_parser = market_commands.add_parser(
@@ -1740,6 +1822,9 @@ def main(
         [Path], SQLiteOptionListingRepository
     ] = build_option_listing_lookup,
     option_market_data_runtime: OptionMarketDataRuntime = build_option_market_data_runtime,
+    option_chain_runtime: Callable[
+        [Path], BuildOptionChainSnapshotUseCase
+    ] = build_option_chain_runtime,
 ) -> int:
     """Run one command and return its exit code."""
     out = stdout if stdout is not None else sys.stdout
@@ -1765,6 +1850,7 @@ def main(
         option_instruments_runtime=option_instruments_runtime,
         option_listing_lookup=option_listing_lookup,
         option_market_data_runtime=option_market_data_runtime,
+        option_chain_runtime=option_chain_runtime,
     )
     try:
         return args.handler(args, context)
