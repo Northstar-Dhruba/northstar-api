@@ -17,8 +17,12 @@ from northstar_application.application_services import (
 )
 from northstar_core.foundation.value_objects import Money
 from northstar_core.futures import FuturesContract, FuturesContractEconomics
-from northstar_core.options import OptionContractEconomics
+from northstar_core.options import OptionContractEconomics, OptionProductReference
 from northstar_core.paper_trading import FuturesPaperOrder, FuturesPaperPortfolio
+from northstar_infrastructure.market_data import (
+    StoredOptionProviderListing,
+    UpstoxOptionMasterSnapshot,
+)
 
 POLICY = "built-in directional MVP"
 PRICE_BASIS = "OPEN of next synced session"
@@ -41,6 +45,33 @@ def option_economics_lines(economics: OptionContractEconomics) -> list[str]:
     return [
         f"Contract: {economics.contract}",
         f"Point value: {point_value.amount} {point_value.currency} / premium-point / contract",
+    ]
+
+
+def option_instrument_sync_lines(
+    product: OptionProductReference, snapshot: UpstoxOptionMasterSnapshot
+) -> list[str]:
+    """Summarize one listing sync without claiming how many listings were new."""
+    return [
+        "OPTION INSTRUMENTS: SYNCED",
+        f"Provider: {snapshot.provider}",
+        f"Product: {product}",
+        f"Snapshot: {snapshot.snapshot_sha256}",
+        f"Master records: {snapshot.record_count}",
+        f"{product.product_code} option records: {snapshot.option_record_count}",
+        "Reference persistence: completed",
+    ]
+
+
+def option_instrument_lines(listing: StoredOptionProviderListing) -> list[str]:
+    return [
+        "OPTION INSTRUMENT: READY",
+        f"Contract: {listing.contract}",
+        f"Provider: {listing.provider}",
+        f"Instrument key: {listing.instrument_key}",
+        f"Exchange lot size: {listing.exchange_lot_size}",
+        f"Established snapshot: {listing.established_snapshot_sha256}",
+        f"Established at: {listing.established_at}",
     ]
 
 

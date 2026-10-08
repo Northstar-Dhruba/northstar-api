@@ -43,6 +43,15 @@ only ``options economics set`` builds it, under the operations lock. Reads use
 build_option_economics_lookup, which creates nothing: not the file, not the
 table. A futures-only database therefore acquires the option table only on the
 first option economics write.
+
+Option instrument reference
+---------------------------
+The NIFTY option listings read from the public Upstox master live in the same
+file in two tables of their own. OptionInstrumentRuntime serves only
+``options instruments sync``, under the operations lock, and its store creates
+the listing tables just before its first write. ``options instruments show``
+uses build_option_listing_lookup, which opens the file read-only and creates
+nothing.
 """
 
 from __future__ import annotations
@@ -92,7 +101,10 @@ from northstar_infrastructure.market_data import (
     NSEFuturesTradingSessionResolver,
     SQLiteFuturesHistoricalMarketDataRepository,
     SQLiteFuturesHistoricalMarketDataStore,
+    SQLiteOptionListingRepository,
+    SQLiteOptionListingStore,
     UpstoxFuturesNativeDailyMarketDataSource,
+    UpstoxOptionInstrumentMaster,
     initialize_futures_market_data_schema,
 )
 from northstar_infrastructure.market_data.upstox_http import UpstoxFetch
@@ -328,6 +340,45 @@ def build_option_economics_runtime(path: Path) -> OptionEconomicsRuntime:
         repository=repository,
         lookup=GetOptionContractEconomicsUseCase(repository),
     )
+
+
+@dataclass(frozen=True, slots=True)
+class OptionInstrumentRuntime:
+    """The Upstox option master and the listing store, for the instrument sync only.
+
+    Building it checks the database path and creates nothing. The store creates
+    the two listing tables itself, immediately before its first write, so a
+    sync whose provider fetch fails leaves the database untouched.
+    """
+
+    master: UpstoxOptionInstrumentMaster
+    store: SQLiteOptionListingStore
+
+
+def build_option_instruments_runtime(
+    path: Path, *, fetch: UpstoxFetch | None = None
+) -> OptionInstrumentRuntime:
+    """Wire the public Upstox option master and the listing store for one database.
+
+    ``fetch`` replaces the master's HTTP transport, for tests only.
+    """
+    _require_option_database_path(path)
+    master = (
+        UpstoxOptionInstrumentMaster()
+        if fetch is None
+        else UpstoxOptionInstrumentMaster(fetch=fetch)
+    )
+    return OptionInstrumentRuntime(master=master, store=SQLiteOptionListingStore(path))
+
+
+def build_option_listing_lookup(path: Path) -> SQLiteOptionListingRepository:
+    """Wire the read-only option listing repository, creating nothing.
+
+    Only the path is checked. A database file that does not exist yet, or one
+    without the listing tables, holds no listings.
+    """
+    _require_option_database_path(path)
+    return SQLiteOptionListingRepository(path)
 
 
 def build_market_sync_runtime(

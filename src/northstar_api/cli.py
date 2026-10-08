@@ -2,6 +2,7 @@
 
     northstar economics set | show
     northstar options economics set | show
+    northstar options instruments sync | show
     northstar market-data sync
     northstar paper run | status
     northstar operations daily
@@ -12,6 +13,12 @@ read from the environment is the selected provider's secret -- DATABENTO_API_KEY
 for ``--provider databento`` (the default) or UPSTOX_ANALYTICS_TOKEN for
 ``--provider upstox`` -- and only ``market-data sync`` reads it. Nothing there
 reads a clock: cutoffs and trading-date ranges are supplied by the operator.
+
+``options instruments sync`` is the one manual command that reads the clock, and
+it reads it exactly once: when the public Upstox instrument master has been
+received, to record when Northstar observed that snapshot. It needs no secret.
+``options instruments show`` reads no clock, contacts no provider and creates
+nothing.
 
 ``operations daily`` is the unattended entry point. It reads its configuration
 and the secret from the environment, reads the wall clock exactly once, syncs
@@ -50,10 +57,10 @@ Exit codes:
                       database's operations lock (nothing was changed)
 
 Every command that mutates the database -- ``economics set``, ``options
-economics set``, ``market-data sync``, ``paper run`` and ``operations daily`` --
-holds that database's single operations lock for its whole run. ``operations
-daily`` treats a held lock as a safe skip and exits 0; a manual command refuses
-with 5.
+economics set``, ``options instruments sync``, ``market-data sync``, ``paper
+run`` and ``operations daily`` -- holds that database's single operations lock
+for its whole run. ``operations daily`` treats a held lock as a safe skip and
+exits 0; a manual command refuses with 5.
     6  PROVIDER       the market-data provider or session calendar failed
 """
 
@@ -129,16 +136,23 @@ from northstar_core.options import (
 from northstar_core.paper_trading import FuturesContractCount, PaperPortfolioIdentity
 from northstar_core.strategy import StrategyIdentity
 from northstar_infrastructure.market_data import (
+    UPSTOX_PROVIDER,
     DatabentoFuturesHistoricalMarketDataSourceError,
     ExchangeCalendarFuturesTradingSessionResolver,
     FuturesHistoricalStorageError,
     FuturesTradingSessionInProgressError,
     NSEFuturesTradingSessionResolver,
+    OptionListingConflictError,
+    OptionListingStorageError,
+    SQLiteOptionListingRepository,
     UpstoxCandleEvidenceLog,
     UpstoxCandleEvidenceLogError,
     UpstoxDailyCandleEvidenceCollector,
     UpstoxDailyCandleEvidenceObservation,
     UpstoxMarketDataSourceError,
+)
+from northstar_infrastructure.market_data.upstox_option_instrument_master import (
+    NIFTY_NSE as UPSTOX_NIFTY_OPTIONS,
 )
 from northstar_infrastructure.persistence import (
     FuturesContractEconomicsStorageError,
@@ -168,11 +182,14 @@ from northstar_api.runtime import (
     DatabaseRuntime,
     FuturesDailyAcquisition,
     OptionEconomicsRuntime,
+    OptionInstrumentRuntime,
     build_daily_bar_finality_policy,
     build_database_runtime,
     build_market_sync_runtime,
     build_option_economics_lookup,
     build_option_economics_runtime,
+    build_option_instruments_runtime,
+    build_option_listing_lookup,
     build_upstox_market_sync_runtime,
 )
 from northstar_api.settings import (
@@ -244,6 +261,8 @@ _STATE_ERRORS: tuple[type[Exception], ...] = (
     OptionContractEconomicsConflictError,
     OptionContractEconomicsContractViolationError,
     OptionContractEconomicsStorageError,
+    OptionListingConflictError,
+    OptionListingStorageError,
 )
 _PROVIDER_ERRORS: tuple[type[Exception], ...] = (
     DatabentoFuturesHistoricalMarketDataSourceError,
@@ -301,6 +320,13 @@ class _Context:
     # Read-only: builds the query without creating the file or the option table.
     option_economics_lookup: Callable[[Path], GetOptionContractEconomicsUseCase] = (
         build_option_economics_lookup
+    )
+    option_instruments_runtime: Callable[[Path], OptionInstrumentRuntime] = (
+        build_option_instruments_runtime
+    )
+    # Read-only: opens the listing reference without creating the file or its tables.
+    option_listing_lookup: Callable[[Path], SQLiteOptionListingRepository] = (
+        build_option_listing_lookup
     )
     # Secrets read by this invocation; every output line is scrubbed of them.
     secrets: list[str] = field(default_factory=list)
@@ -476,6 +502,61 @@ def _options_economics_show(args: argparse.Namespace, context: _Context) -> Exit
             "Use 'northstar options economics set' to configure them.",
         ) from error
     context.write(render.option_economics_lines(economics))
+    return ExitCode.SUCCESS
+
+
+# ---------------------------------------------------------------------------
+# options instruments
+# ---------------------------------------------------------------------------
+
+
+def _listing_product(product: OptionProductReference) -> OptionProductReference:
+    """Refuse every option product but the one the listing reference supports."""
+    if product != UPSTOX_NIFTY_OPTIONS:
+        raise CommandError(
+            ExitCode.INPUT,
+            f"Unsupported option product {product}; option instruments support only "
+            f"{UPSTOX_NIFTY_OPTIONS}.",
+        )
+    return product
+
+
+def _options_instruments_sync(args: argparse.Namespace, context: _Context) -> ExitCode:
+    product = _listing_product(
+        OptionProductReference(
+            _parse("product", args.product, Symbol),
+            _parse("exchange", args.exchange, ExchangeCode),
+        )
+    )
+    database = _database(args)
+
+    with DatabaseOperationsLock(database):
+        runtime = context.option_instruments_runtime(database)
+        # The clock is read once, inside the fetch, after the master has been received.
+        snapshot = runtime.master.fetch_snapshot(product, clock=context.clock)
+        accepted = runtime.store.store(snapshot)
+    if isinstance(accepted, bool) or accepted != len(snapshot.listings):
+        raise CommandError(
+            ExitCode.STATE,
+            f"Option listing store accepted {accepted!r} listings, "
+            f"expected {len(snapshot.listings)}.",
+        )
+    context.write(render.option_instrument_sync_lines(product, snapshot))
+    return ExitCode.SUCCESS
+
+
+def _options_instruments_show(args: argparse.Namespace, context: _Context) -> ExitCode:
+    contract = _option_contract(args)
+    _listing_product(contract.product)
+    # Read-only: no lock, no clock, no network, no schema initialization, no file creation.
+    listing = context.option_listing_lookup(_database(args)).get_listing(UPSTOX_PROVIDER, contract)
+    if listing is None:
+        raise CommandError(
+            ExitCode.DATA,
+            f"Option instrument mapping not stored for {contract} (provider {UPSTOX_PROVIDER}). "
+            "Use 'northstar options instruments sync' while the contract is listed.",
+        )
+    context.write(render.option_instrument_lines(listing))
     return ExitCode.SUCCESS
 
 
@@ -1300,6 +1381,27 @@ def build_parser() -> argparse.ArgumentParser:
     _add_option_contract(option_show_parser)
     option_show_parser.set_defaults(handler=_options_economics_show)
 
+    option_instruments = option_groups.add_parser(
+        "instruments", help="preserve the provider listing of exact option contracts"
+    )
+    option_instrument_commands = option_instruments.add_subparsers(dest="command", required=True)
+    instrument_sync_parser = option_instrument_commands.add_parser(
+        "sync",
+        help=(
+            "store every current NIFTY option listing from the public Upstox instrument "
+            "master (no token)"
+        ),
+    )
+    _add_database(instrument_sync_parser)
+    _add_product(instrument_sync_parser)
+    instrument_sync_parser.set_defaults(handler=_options_instruments_sync)
+    instrument_show_parser = option_instrument_commands.add_parser(
+        "show", help="show one exact option contract's stored provider listing (read-only)"
+    )
+    _add_database(instrument_show_parser)
+    _add_option_contract(instrument_show_parser)
+    instrument_show_parser.set_defaults(handler=_options_instruments_show)
+
     market = groups.add_parser("market-data", help="sync completed daily sessions")
     market_commands = market.add_subparsers(dest="command", required=True)
     sync_parser = market_commands.add_parser(
@@ -1489,6 +1591,12 @@ def main(
     option_economics_lookup: Callable[
         [Path], GetOptionContractEconomicsUseCase
     ] = build_option_economics_lookup,
+    option_instruments_runtime: Callable[
+        [Path], OptionInstrumentRuntime
+    ] = build_option_instruments_runtime,
+    option_listing_lookup: Callable[
+        [Path], SQLiteOptionListingRepository
+    ] = build_option_listing_lookup,
 ) -> int:
     """Run one command and return its exit code."""
     out = stdout if stdout is not None else sys.stdout
@@ -1511,6 +1619,8 @@ def main(
         upstox_candle_evidence=upstox_candle_evidence,
         option_economics_runtime=option_economics_runtime,
         option_economics_lookup=option_economics_lookup,
+        option_instruments_runtime=option_instruments_runtime,
+        option_listing_lookup=option_listing_lookup,
     )
     try:
         return args.handler(args, context)
