@@ -1,0 +1,66 @@
+<!--
+  Northstar India futures operation for Windows Task Scheduler (Stage 1).
+
+  A template. Register-NorthstarIndiaOperationsTask.ps1 fills the placeholders
+  with absolute paths and the current Windows user, and registers the task
+  DISABLED (Settings/Enabled is false). The operator enables it explicitly.
+
+  Hourly, as the Linux timer: a polling cadence, not a finality rule. Each run
+  only checks for approved work; finality is NORTHSTAR_FUTURES_FINAL_THROUGH in
+  .env, set by a person and never by this task. Missed starts run as soon as
+  possible; a start while a run is active is ignored, and Northstar's own
+  database operations lock skips any other overlapping writer.
+
+  The task runs as the signed-in user that runs Docker Desktop, with an
+  interactive token (no stored password) and least privilege. The execution
+  limit is above the wrapper's own timeout, so the wrapper, not Task
+  Scheduler, ends a stuck run and removes its container.
+-->
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Northstar India futures operation (NIFTY / NSE / Upstox): runs the india-operations service once per hour through Docker Desktop. Never changes finality approval.</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <TimeTrigger>
+      <Repetition>
+        <Interval>PT1H</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+      <StartBoundary>2026-01-01T00:00:00</StartBoundary>
+      <Enabled>true</Enabled>
+    </TimeTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>{{USER_ID}}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>false</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT55M</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{{POWERSHELL}}</Command>
+      <Arguments>{{ARGUMENTS}}</Arguments>
+      <WorkingDirectory>{{WORKING_DIRECTORY}}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
