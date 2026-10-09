@@ -34,6 +34,14 @@ container; the volume is what separates them.
 - `Caddyfile` -- mounted read-only over the one baked into the web image.
 - `.env.example` -- copy to `.env` here; secrets and deployment settings only.
 - `systemd/northstar-india-daily.service`, `systemd/northstar-india-daily.timer`.
+- `windows/Invoke-NorthstarIndiaOperations.ps1` -- the Windows Task Scheduler
+  wrapper: preflight, one bounded `docker compose run --rm -T --no-deps
+  india-operations`, cleanup of only its own container, UTC per-run logs and an
+  atomic `last-run.json`. It never writes `.env` or changes finality.
+- `windows/Register-NorthstarIndiaOperationsTask.ps1` and
+  `windows/northstar-india-operations.task.xml` -- register the hourly task for
+  the Docker Desktop user, **disabled**. Windows hosts follow runbook
+  section 18 instead of the systemd commands below.
 
 These files were authored and statically tested on the development machine.
 `docker compose config`, Caddy validation, image builds, volume creation,
