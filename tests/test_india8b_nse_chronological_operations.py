@@ -138,6 +138,9 @@ class _Clock:
 
 # After the contract's life: every operated session is historical.
 _AFTER_THE_CONTRACT = datetime(2026, 11, 2, 12, 0, tzinfo=UTC)
+# 08:30 IST on the expiration date, before its session opens: every session
+# before expiry is historical, and the contract is not yet past its expiry.
+_EXPIRY_MORNING = datetime(2026, 10, 27, 3, 0, tzinfo=UTC)
 
 
 def _on_session(bar: int) -> datetime:
@@ -153,7 +156,7 @@ def _daily(op: Operator, fetch=None, *, clock=None, **settings) -> Outcome:
         env=_env(op, **settings),
         stdout=out,
         stderr=err,
-        clock=clock or _Clock(_AFTER_THE_CONTRACT),
+        clock=clock or _Clock(_EXPIRY_MORNING),
         upstox_market_sync_runtime=lambda path, token, current_instant=None: (
             build_upstox_market_sync_runtime(
                 path, token, fetch=fetch or op.upstox, current_instant=current_instant
@@ -451,7 +454,8 @@ def test_the_expiry_window_and_then_rollover_required(tmp_path: Path) -> None:
     e6, e5 = _E8_BAR + 2, _E8_BAR + 3
     op = _operator(tmp_path, "expiry", _expiry_market(), bootstrap=_E8_BAR - 1)
 
-    run = _daily(op, final_through="2026-10-30", go_live=_E8_BAR)
+    # Starting flat, the clock only routes: after expiry every session is historical.
+    run = _daily(op, clock=_Clock(_AFTER_THE_CONTRACT), final_through="2026-10-30", go_live=_E8_BAR)
 
     assert run.code == ExitCode.SUCCESS, run.err
     assert "Expiry flatten: yes" in _session_block(run.out, e6)

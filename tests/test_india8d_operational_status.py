@@ -364,6 +364,8 @@ def test_e5_is_the_protected_no_reopen_window_and_the_portfolio_is_flat(tmp_path
         "window": "protected",
         "flatten_required": True,
         "position_flat": True,
+        "pending_orders": "0",
+        "assessed_as_of": "2026-10-19T10:10:00Z",
         "reopening_blocked": True,
     }
 

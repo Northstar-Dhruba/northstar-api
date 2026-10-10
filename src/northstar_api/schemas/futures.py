@@ -175,11 +175,19 @@ class OperationalBacklogResponse(BaseModel):
     counts persisted daily bars from the next required session on. Caught up
     means neither count is positive. This is the latest processed state, not
     the outcome of any particular run, which is not persisted.
+
+    ``expiry_exception`` replaces ``rollover_required`` when no session is left
+    through expiry but the contract still holds a position or pending order.
     """
 
     status: Availability
     reason: str | None
-    stage: Literal["go_live_required", "not_started", "operating", "rollover_required"] | None
+    stage: (
+        Literal[
+            "go_live_required", "not_started", "operating", "rollover_required", "expiry_exception"
+        ]
+        | None
+    )
     go_live: str | None
     latest_decision_session: str | None
     latest_market_session: str | None
@@ -199,6 +207,11 @@ class ExpirySafetyResponse(BaseModel):
     decision that must take the position flat (E-(K+1)) and ``protected`` from
     E-K through expiry. ``reopening_blocked`` is whether the next decision is
     governed by the guard, so no signal can open or increase the contract.
+
+    The window is historical: it is assessed as of ``assessed_as_of``, the
+    latest decision, never today's date. ``position_flat`` and
+    ``pending_orders`` (unfilled orders in this contract) are the persisted
+    state at the dashboard's cutoff; only a fill makes a position flat.
     """
 
     status: Availability
@@ -209,6 +222,8 @@ class ExpirySafetyResponse(BaseModel):
     window: Literal["outside", "flatten", "protected"] | None
     flatten_required: bool | None
     position_flat: bool | None
+    pending_orders: str | None
+    assessed_as_of: str | None
     reopening_blocked: bool | None
 
 

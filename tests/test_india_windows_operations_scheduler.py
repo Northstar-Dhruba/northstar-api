@@ -431,13 +431,27 @@ def test_a_completed_run_is_logged_recorded_and_passes_exit_zero(harness: Harnes
         (4, _COMPLETED, "FAILED"),
         (5, "", "FAILED"),
         (6, "", "FAILED"),
+        (7, "STATUS: EXPIRY EXCEPTION\n", "EXPIRY_EXCEPTION"),
     ],
-    ids=["waiting", "skipped", "no-status", "internal", "rollover", "data", "state", "provider"],
+    ids=[
+        "waiting",
+        "skipped",
+        "no-status",
+        "internal",
+        "rollover",
+        "data",
+        "state",
+        "provider",
+        "expiry-exception",
+    ],
 )
 def test_northstar_exit_codes_pass_through_and_outcomes_are_classified(
     harness: Harness, exit_code: int, stdout: str, outcome: str
 ) -> None:
-    stderr = "STATE ERROR: conflict\n" if exit_code == 5 else ""
+    stderr = {
+        5: "STATE ERROR: conflict\n",
+        7: "EXPIRY_EXCEPTION ERROR: Expiry exception: NIFTY@NSE 2026-10-27\n",
+    }.get(exit_code, "")
     harness.scenario(stdout=stdout, stderr=stderr, exit_code=exit_code)
 
     result = harness.run()
@@ -449,6 +463,9 @@ def test_northstar_exit_codes_pass_through_and_outcomes_are_classified(
     )  # fmt: skip
     if exit_code == 5:
         assert status["reason"] == "STATE ERROR: conflict"
+    if exit_code == 7:
+        assert status["exitClass"] == "EXPIRY_EXCEPTION"
+        assert status["reason"].startswith("EXPIRY_EXCEPTION ERROR: Expiry exception:")
 
 
 @_windows

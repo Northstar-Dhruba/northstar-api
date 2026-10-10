@@ -27,8 +27,12 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from typing import TextIO
+from zoneinfo import ZoneInfo
 
-from northstar_application.application_services import FuturesPaperTradingSessionResult
+from northstar_application.application_services import (
+    FuturesPaperTradingSessionResult,
+    FuturesPaperTradingSnapshot,
+)
 from northstar_application.ports import (
     FuturesDailyBarFinality,
     FuturesDailyBarFinalityPolicy,
@@ -41,6 +45,7 @@ from northstar_application.ports import (
 )
 from northstar_core.foundation.value_objects import PointInTime, Timeframe
 from northstar_core.futures import FuturesContract, FuturesOHLCVBar
+from northstar_core.paper_trading import FuturesPaperOrder, FuturesPosition
 from northstar_core.strategy import StrategyIdentity
 
 LOGGER_NAME = "northstar.operations"
@@ -51,6 +56,8 @@ NO_HISTORY = (
 _DAILY = Timeframe("1d")
 # Widens only the calendar enumeration; membership is decided by resolved closes.
 _ENUMERATION_MARGIN = timedelta(days=7)
+# The chronological operation runs NSE contracts only; their calendar date is India's.
+INDIA_TIMEZONE = ZoneInfo("Asia/Kolkata")
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,6 +220,49 @@ def plan_session_backlog(
         eligible=tuple(eligible),
         exhausted=not candidates,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class FuturesContractExposure:
+    """The operated contract's paper position and pending orders, from persisted facts.
+
+    Only a fill closes a position: a flatten decision or an unfilled order
+    leaves the contract exposed. ``resolved`` means no position and no
+    pending order remain in this contract.
+    """
+
+    contract: FuturesContract
+    position: FuturesPosition | None
+    pending_orders: tuple[FuturesPaperOrder, ...]
+
+    @property
+    def resolved(self) -> bool:
+        return self.position is None and not self.pending_orders
+
+
+def contract_exposure(
+    snapshot: FuturesPaperTradingSnapshot, contract: FuturesContract
+) -> FuturesContractExposure:
+    """Return the contract's exposure in the snapshot; nothing is recomputed or written."""
+    return FuturesContractExposure(
+        contract=contract,
+        position=snapshot.portfolio.get_position(contract),
+        pending_orders=tuple(
+            order for order in snapshot.pending_orders if order.intent.contract == contract
+        ),
+    )
+
+
+def india_calendar_date(now: datetime) -> date:
+    """Return the Asia/Kolkata calendar date of one aware clock reading."""
+    if not isinstance(now, datetime) or now.utcoffset() is None:
+        raise TypeError("The daily operation clock must return an aware datetime.")
+    return now.astimezone(INDIA_TIMEZONE).date()
+
+
+def is_past_expiry(contract: FuturesContract, today: date) -> bool:
+    """Return whether ``today`` is strictly later than the contract's expiration date."""
+    return today > date.fromisoformat(contract.expiration_date.value)
 
 
 class FuturesChronologicalOperationStatus(StrEnum):

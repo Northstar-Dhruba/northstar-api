@@ -18,6 +18,12 @@ whether persisted data or approved finality is ahead of it.
 A calendar that fails closed, or a go-live the operation would refuse, makes
 only the affected part unavailable, with its reason; the dashboard stays
 readable.
+
+A contract with no session left through expiry is ``expiry_exception``, not
+``rollover_required``, while it still holds a position or a pending order:
+only a fill makes it flat. The expiry window is assessed as of the latest
+decision, never today's date; the daily operation alone compares the real
+India date with the expiration date.
 """
 
 from __future__ import annotations
@@ -39,8 +45,10 @@ from northstar_core.foundation.value_objects import PointInTime
 from northstar_core.futures import FuturesContract, FuturesOHLCVBar
 
 from northstar_api.operations import (
+    FuturesContractExposure,
     FuturesOperationConfigurationError,
     FuturesSessionBacklog,
+    contract_exposure,
     plan_session_backlog,
 )
 from northstar_api.runtime import (
@@ -90,14 +98,15 @@ def operational_status(
         else None
     )
     latest_bar = snapshot.latest_market_bar if snapshot is not None else None
-    backlog, plan = _backlog(settings, resolver, latest, latest_bar, bars)
+    exposure = contract_exposure(snapshot, contract) if snapshot is not None else None
+    backlog, plan = _backlog(settings, resolver, latest, latest_bar, bars, exposure)
     guard = expiry_guard_for(contract)
     return OperationsResponse(
         status="available",
         reason=None,
         finality=_finality(settings, plan),
         backlog=backlog,
-        expiry=_expiry(guard, contract, snapshot, latest, plan) if guard is not None else None,
+        expiry=_expiry(guard, contract, exposure, latest, plan) if guard is not None else None,
     )
 
 
@@ -130,6 +139,7 @@ def _backlog(
     latest: PointInTime | None,
     latest_bar: FuturesOHLCVBar | None,
     bars: Sequence[FuturesOHLCVBar],
+    exposure: FuturesContractExposure | None,
 ) -> tuple[OperationalBacklogResponse, FuturesSessionBacklog | None]:
     """Return the backlog section and, when it could be planned, the operation's plan."""
     contract, go_live = settings.contract, settings.operations.go_live
@@ -161,7 +171,8 @@ def _backlog(
     )
     final = len(plan.eligible)
     if plan.exhausted:
-        stage = "rollover_required"
+        unresolved = exposure is not None and not exposure.resolved
+        stage = "expiry_exception" if unresolved else "rollover_required"
     else:
         stage = "not_started" if latest is None else "operating"
     response = _backlog_response(
@@ -218,19 +229,18 @@ def _backlog_response(
 def _expiry(
     guard: FuturesExpiryFlattenGuard,
     contract: FuturesContract,
-    snapshot: FuturesPaperTradingSnapshot | None,
+    exposure: FuturesContractExposure | None,
     latest: PointInTime | None,
     plan: FuturesSessionBacklog | None,
 ) -> ExpirySafetyResponse:
     window_size = guard.policy.sessions_before_expiry
-    position_flat = (
-        snapshot.portfolio.get_position(contract) is None if snapshot is not None else None
-    )
     following = plan.assessments[0].session if plan is not None and plan.assessments else None
     common = {
         "expiry_session": contract.expiration_date.value,
         "flatten_sessions_before_expiry": str(window_size),
-        "position_flat": position_flat,
+        "position_flat": exposure.position is None if exposure is not None else None,
+        "pending_orders": _count(len(exposure.pending_orders)) if exposure is not None else None,
+        "assessed_as_of": latest.value if latest is not None else None,
     }
     try:
         assessed = guard.assess(contract, latest) if latest is not None else None
