@@ -84,6 +84,11 @@ economics set``, ``options instruments sync``, ``options market-data sync``,
 database's single operations lock for its whole run. ``operations daily``
 treats a held lock as a safe skip and exits 0; a manual command refuses with 5.
     6  PROVIDER       the market-data provider or session calendar failed
+    7  EXPIRY_EXCEPTION
+                      ``operations daily`` only: the operated contract still holds
+                      a position or pending order and either no session is left
+                      through its expiry or the Asia/Kolkata date is after its
+                      expiration date; nothing was settled, cancelled or rolled over
 
 ``options market-data sync`` also exits 1 if the open interest a source
 captured does not correspond exactly to the bars being stored: a wiring defect,
@@ -209,11 +214,15 @@ from northstar_api.finality_evidence import EvidenceFilters, build_report, repor
 from northstar_api.operations import (
     NO_HISTORY,
     FuturesChronologicalOperationResult,
+    FuturesContractExposure,
     FuturesDailyOperationResult,
     FuturesOperationConfigurationError,
     FuturesSessionBacklog,
     captured_instant,
     completed_sessions_after,
+    contract_exposure,
+    india_calendar_date,
+    is_past_expiry,
     latest_daily_bar,
     latest_frozen_decision,
     operation_logger,
@@ -275,6 +284,9 @@ class ExitCode(IntEnum):
     DATA = 4
     STATE = 5
     PROVIDER = 6
+    # The operated contract is past expiry, or out of sessions, while a position
+    # or pending order remains in it. Nothing is settled, cancelled or rolled.
+    EXPIRY_EXCEPTION = 7
 
 
 class CommandError(Exception):
@@ -1205,6 +1217,50 @@ def _replay_latest_cutoff(
     )
 
 
+def _contract_exposure(
+    runtime: DatabaseRuntime, settings: FuturesOperationSettings, latest: PointInTime | None
+) -> FuturesContractExposure | None:
+    """Read the operated contract's position and pending orders; nothing is written.
+
+    The cutoff is the later of the latest frozen decision and the latest
+    persisted daily bar, so every persisted order and fill of the contract is
+    visible. Without either fact the contract has no paper history.
+    """
+    bar = latest_daily_bar(runtime.market_repository, settings.contract)
+    cutoff = bar.point_in_time if bar is not None else None
+    if latest is not None and (cutoff is None or _is_before(cutoff, latest)):
+        cutoff = latest
+    if cutoff is None:
+        return None
+    snapshot = runtime.snapshot.execute(None, settings.strategy, settings.portfolio, cutoff)
+    return contract_exposure(snapshot, settings.contract)
+
+
+def _expiry_exception(
+    context: _Context,
+    log: logging.Logger,
+    header: list[str],
+    exposure: FuturesContractExposure,
+    detected: str,
+) -> CommandError:
+    """Report an unresolved contract instead of WAITING or ROLLOVER REQUIRED."""
+    context.write([*header, "", *render.expiry_exception_lines(exposure, detected)])
+    log.error(
+        "expiry exception: %s %s; position %s, %d pending order(s)",
+        exposure.contract,
+        detected,
+        "flat" if exposure.position is None else exposure.position.net_contracts,
+        len(exposure.pending_orders),
+    )
+    return CommandError(
+        ExitCode.EXPIRY_EXCEPTION,
+        f"Expiry exception: {exposure.contract} {detected} with "
+        f"{'an open position' if exposure.position is not None else 'no open position'} "
+        f"and {len(exposure.pending_orders)} pending order(s). Nothing was settled, "
+        "cancelled or rolled over; investigate before configuring the next contract.",
+    )
+
+
 def _chronological_daily_operation(
     context: _Context,
     log: logging.Logger,
@@ -1214,13 +1270,18 @@ def _chronological_daily_operation(
 ) -> FuturesChronologicalOperationResult:
     """Process every eligible session in order; the caller holds the operations lock.
 
-    Eligibility and finality read no clock. Only once eligible final sessions
-    exist and the token is available is the clock read -- exactly once -- and
-    that captured instant only routes the venue's current date to Upstox's
-    current-day endpoint. Market data for the final sessions is acquired as one
-    range, then each session is paper-run at its own close, oldest first,
-    stopping at the first failure so no later decision is ever taken past a
-    session that did not complete.
+    Eligibility and finality read no clock. The clock is read at most once:
+    when the contract still holds a position or pending order, to compare the
+    Asia/Kolkata date with its expiration date, or else once eligible final
+    sessions exist and the token is available. The same captured instant then
+    routes the venue's current date to Upstox's current-day endpoint. Market
+    data for the final sessions is acquired as one range, then each session is
+    paper-run at its own close, oldest first, stopping at the first failure so
+    no later decision is ever taken past a session that did not complete.
+
+    An unresolved contract -- out of sessions, or past its expiration date --
+    is an EXPIRY EXCEPTION, never ROLLOVER REQUIRED or WAITING, and it is
+    reported before any provider request.
     """
     contract = settings.contract
     log.info("chronological daily operation started")
@@ -1266,6 +1327,12 @@ def _chronological_daily_operation(
     if backlog.exhausted:
         if latest is not None:
             _replay_latest_cutoff(context, runtime, settings, latest)
+        # S-1: a rollover is only for a contract left flat with nothing pending.
+        exposure = _contract_exposure(runtime, settings, latest)
+        if exposure is not None and not exposure.resolved:
+            raise _expiry_exception(
+                context, log, header, exposure, "has no trading session left through expiry"
+            )
         context.write([*header, "", "STATUS: ROLLOVER REQUIRED"])
         log.warning("no trading session remains through expiry; rollover required")
         raise CommandError(
@@ -1273,6 +1340,23 @@ def _chronological_daily_operation(
             f"Rollover required: {contract} has no trading session left to operate through "
             "its expiry. Configure the next contract explicitly; nothing rolls automatically.",
         )
+
+    # S-2: past its expiration date an exposed contract can neither wait nor be
+    # acquired; report it before any provider request can fail and hide it.
+    now: datetime | None = None
+    exposure = _contract_exposure(runtime, settings, latest)
+    if exposure is not None and not exposure.resolved:
+        now = context.clock()
+        today = india_calendar_date(now)
+        log.info("India date %s; %s expires %s", today, contract, contract.expiration_date)
+        if is_past_expiry(contract, today):
+            raise _expiry_exception(
+                context,
+                log,
+                header,
+                exposure,
+                f"is past its expiration date (India date {today.isoformat()})",
+            )
 
     waiting = backlog.waiting_on
     if not backlog.eligible:
@@ -1289,9 +1373,11 @@ def _chronological_daily_operation(
             ExitCode.CONFIGURATION,
             f"{UPSTOX_TOKEN_VARIABLE} is not set; operations daily needs Upstox credentials.",
         )
-    # The one clock read, after eligibility: it routes the venue's current date
-    # to the current-day endpoint and decides nothing about finality.
-    now = context.clock()
+    # The one clock read, after eligibility unless the expiry check already
+    # took it: it routes the venue's current date to the current-day endpoint
+    # and decides nothing about finality.
+    if now is None:
+        now = context.clock()
     captured_instant(now)  # refuses a naive instant
     acquisition = context.upstox_market_sync_runtime(settings.database, token, current_instant=now)
     acquired = _acquire(

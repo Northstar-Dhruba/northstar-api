@@ -34,6 +34,8 @@ from northstar_infrastructure.market_data import (
     UpstoxOptionMasterSnapshot,
 )
 
+from northstar_api.operations import FuturesContractExposure
+
 POLICY = "built-in directional MVP"
 PRICE_BASIS = "OPEN of next synced session"
 
@@ -292,14 +294,44 @@ def pnl_unavailable_lines(reason: str) -> list[str]:
     return ["", "P&L (gross simulated)", "P&L: unavailable", f"Reason: {reason}"]
 
 
+def _pending_lines(pending: tuple[FuturesPaperOrder, ...]) -> list[str]:
+    return [
+        f"PENDING {order.intent.contract}: {order.intent.side.value} "
+        f"{order.intent.contracts.value} decided {order.intent.decided_at} "
+        f"ID {order.identity.identity}"
+        for order in pending
+    ]
+
+
 def execution_summary_lines(
     orders: int, fills: int, pending: tuple[FuturesPaperOrder, ...]
 ) -> list[str]:
-    lines = ["", "SUMMARY", f"Orders: {orders}", f"Fills: {fills}", f"Pending: {len(pending)}"]
-    for order in pending:
-        intent = order.intent
-        lines.append(
-            f"PENDING {intent.contract}: {intent.side.value} {intent.contracts.value} "
-            f"decided {intent.decided_at} ID {order.identity.identity}"
-        )
-    return lines
+    return [
+        "",
+        "SUMMARY",
+        f"Orders: {orders}",
+        f"Fills: {fills}",
+        f"Pending: {len(pending)}",
+        *_pending_lines(pending),
+    ]
+
+
+def expiry_exception_lines(exposure: FuturesContractExposure, detected: str) -> list[str]:
+    """Describe an unresolved contract; no rollover is recommended."""
+    position = exposure.position
+    if position is None:
+        held = "Flat"
+    else:
+        direction = "LONG" if position.net_contracts > 0 else "SHORT"
+        held = f"OPEN {direction} {abs(position.net_contracts)} @ {position.average_entry.value}"
+    return [
+        "STATUS: EXPIRY EXCEPTION",
+        f"Affected contract: {exposure.contract}",
+        f"Expiration date: {exposure.contract.expiration_date.value}",
+        f"Detected: {detected}",
+        f"Position: {held}",
+        f"Pending orders: {len(exposure.pending_orders)}",
+        *_pending_lines(exposure.pending_orders),
+        "Nothing was settled, cancelled, expired, filled or rolled over.",
+        "Do not configure the next contract. Follow the Expiry Exception Operator Procedure.",
+    ]

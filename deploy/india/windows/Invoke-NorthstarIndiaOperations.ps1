@@ -30,7 +30,9 @@
 
     Exit codes
     ----------
-    0-6  Northstar's own exit code, passed through unchanged.
+    0-7  Northstar's own exit code, passed through unchanged. 7 is an expiry
+         exception: the operated contract is out of sessions or past its
+         expiration date while a position or pending order remains in it.
     10   Docker unavailable: the docker CLI, the Docker Desktop engine (in
          Linux-containers mode) or Docker Compose could not be used. Nothing ran.
     11   Deployment invalid: the deployment directory, compose.yaml or .env is
@@ -49,7 +51,12 @@
     WAITING    exit 0 and Northstar printed "STATUS: WAITING".
     SKIPPED    exit 0 and Northstar printed "DAILY OPERATION: SKIPPED" (another
                operations writer held the database lock).
-    FAILED     any non-zero exit, or exit 0 without a recognised status line.
+    EXPIRY_EXCEPTION
+               exit 7 and Northstar printed "STATUS: EXPIRY EXCEPTION". It is
+               never WAITING or a rollover: follow the Expiry Exception
+               Operator Procedure.
+    FAILED     any other non-zero exit, or exit 0 without a recognised status
+               line.
 
 .PARAMETER DeploymentDirectory
     The India deployment directory holding compose.yaml and .env. Defaults to
@@ -134,8 +141,8 @@ $ExitTimeout = 12
 $ExitWrapperError = 13
 $ExitClasses = @{
     0 = 'SUCCESS'; 1 = 'INTERNAL'; 2 = 'INPUT'; 3 = 'CONFIGURATION'; 4 = 'DATA'; 5 = 'STATE'
-    6 = 'PROVIDER'; 10 = 'DOCKER_UNAVAILABLE'; 11 = 'DEPLOYMENT_INVALID'; 12 = 'TIMEOUT'
-    13 = 'WRAPPER_ERROR'
+    6 = 'PROVIDER'; 7 = 'EXPIRY_EXCEPTION'; 10 = 'DOCKER_UNAVAILABLE'; 11 = 'DEPLOYMENT_INVALID'
+    12 = 'TIMEOUT'; 13 = 'WRAPPER_ERROR'
 }
 $LogNamePattern = '^\d{8}T\d{6}Z-[0-9a-f]{8}\.log$'
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
@@ -798,10 +805,14 @@ function Invoke-Operation {
         Where-Object { $_ -match '^(STATUS: |DAILY OPERATION: SKIPPED)' } |
         Select-Object -Last 1
     $errorLine = ($text.Stderr -split "`r?`n") |
-        Where-Object { $_ -match '^[A-Z]+ ERROR: ' } |
+        Where-Object { $_ -match '^[A-Z_]+ ERROR: ' } |
         Select-Object -First 1
     $Status.statusLine = $statusLine
-    if ($code -ne 0) {
+    if ($code -eq 7) {
+        # Never reported as WAITING or as a rollover, whatever else was printed.
+        $Status.outcome = 'EXPIRY_EXCEPTION'
+        if ($errorLine) { $Status.reason = $errorLine } else { $Status.reason = 'expiry exception (exit 7)' }
+    } elseif ($code -ne 0) {
         $Status.outcome = 'FAILED'
         if ($errorLine) { $Status.reason = $errorLine } else { $Status.reason = "operation exited $code" }
     } elseif ($statusLine -match '^DAILY OPERATION: SKIPPED') {
