@@ -53,7 +53,9 @@
 
 .PARAMETER DeploymentDirectory
     The India deployment directory holding compose.yaml and .env. Defaults to
-    the parent of this script's directory.
+    the parent of this script's directory. The default is resolved in the
+    script body: Windows PowerShell 5.1 leaves $PSScriptRoot empty while an
+    advanced script's parameter defaults are evaluated.
 
 .PARAMETER LogDirectory
     Where logs\<run id>.log and last-run.json are written. Defaults to
@@ -75,22 +77,53 @@
 .PARAMETER PreflightOnly
     Run every preflight check, log the result and exit without running the
     operation. last-run.json is not changed.
+
+.PARAMETER ProjectName
+    The Compose project. Production omits it: the default, northstar-india, is
+    the production project and its execution path is unchanged.
+
+    Any other value is an isolated acceptance project and must be named
+    northstar-india-acceptance-<id>. Acceptance runs fail closed (exit 11),
+    before any log or status file is written or Docker is called, unless
+    -DeploymentDirectory and -LogDirectory are both given explicitly as local
+    drive paths (never UNC or device paths) that, resolved through junctions,
+    symbolic links and subst drives, overlap neither production directory, and
+    the log directory holds no last-run.json from another project. After
+    `docker compose config`, the rendered Compose model is checked against an
+    allowlist: only session-named local volumes without driver options, only
+    internal session bridge networks, session volume mounts only, the
+    northstar-api:india image with pull_policy never, NORTHSTAR_* variables
+    without credentials, and no other setting in force.
 #>
 [CmdletBinding()]
 param(
-    [string] $DeploymentDirectory = (Join-Path $PSScriptRoot '..'),
+    [string] $DeploymentDirectory,
     [string] $LogDirectory = (Join-Path $env:LOCALAPPDATA 'Northstar\india-operations'),
     [ValidateRange(1, 86400)] [int] $TimeoutSeconds = 2700,
     [ValidateRange(1, 3600)] [int] $PreflightTimeoutSeconds = 60,
     [ValidateRange(0, 36500)] [int] $LogRetentionDays = 90,
     [string] $DockerExecutable = 'docker',
-    [switch] $PreflightOnly
+    [switch] $PreflightOnly,
+    [string] $ProjectName = 'northstar-india'
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$ProjectName = 'northstar-india'
+$BoundAtStart = $PSBoundParameters
+if (-not $BoundAtStart.ContainsKey('DeploymentDirectory')) {
+    # Resolved here, not as a parameter default: see .PARAMETER DeploymentDirectory.
+    $DeploymentDirectory = Join-Path $PSScriptRoot '..'
+}
+$ProductionProjectName = 'northstar-india'
+# Only these names may run outside production; anything else is refused.
+$AcceptanceProjectPattern = '^northstar-india-acceptance-[a-z0-9][a-z0-9-]{3,39}$'
+# Named explicitly for a clear message; the session-prefix rule already refuses
+# every other stack's volumes too.
+$ProductionVolumeNames = @(
+    'northstar-india-data', 'northstar-india-caddy-data', 'northstar-india-caddy-config'
+)
+$IsAcceptance = -not ($ProjectName -ceq $ProductionProjectName)
 $Service = 'india-operations'
 $Image = 'northstar-api:india'
 $StopGraceSeconds = 30
@@ -121,6 +154,7 @@ $script:Captured = $null
 $Status = [ordered]@{
     schema              = $StatusSchema
     runId               = $RunId
+    projectName         = $ProjectName
     outcome             = 'RUNNING'
     reason              = $null
     exitCode            = $null
@@ -351,6 +385,290 @@ function Remove-ExpiredLogs {
         Remove-Item -Force
 }
 
+function Test-PathOverlap([string] $First, [string] $Second) {
+    $one = $First.TrimEnd('\') + '\'
+    $two = $Second.TrimEnd('\') + '\'
+    return $one.StartsWith($two, [StringComparison]::OrdinalIgnoreCase) -or
+        $two.StartsWith($one, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Resolve-AcceptancePath([string] $Path) {
+    # Acceptance only. The final path of the deepest existing ancestor -- through
+    # junctions, symbolic links, subst drives and 8.3 names -- plus the remainder
+    # that does not exist yet. Compiled on first use; production never loads it.
+    if (-not ('NorthstarAcceptancePath' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+
+public static class NorthstarAcceptancePath
+{
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFileW(
+        string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern uint GetFinalPathNameByHandleW(
+        SafeFileHandle handle, StringBuilder path, uint length, uint flags);
+
+    // No access rights, shared, existing only, directories allowed (backup semantics).
+    public static string Resolve(string path)
+    {
+        using (SafeFileHandle handle = CreateFileW(path, 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero))
+        {
+            if (handle.IsInvalid) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+            StringBuilder buffer = new StringBuilder(1024);
+            uint length = GetFinalPathNameByHandleW(handle, buffer, (uint) buffer.Capacity, 0);
+            if (length >= buffer.Capacity)
+            {
+                buffer = new StringBuilder((int) length + 1);
+                length = GetFinalPathNameByHandleW(handle, buffer, (uint) buffer.Capacity, 0);
+            }
+            if (length == 0 || length >= buffer.Capacity) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+            return buffer.ToString();
+        }
+    }
+}
+'@
+    }
+    $existing = [System.IO.Path]::GetFullPath($Path)
+    $remainder = New-Object System.Collections.Generic.List[string]
+    # Attributes are -1 only when nothing is there; a dangling link is not skipped
+    # over, it fails to resolve below.
+    while ([int] [System.IO.DirectoryInfo]::new($existing).Attributes -eq -1) {
+        $parent = [System.IO.Path]::GetDirectoryName($existing)
+        if (-not $parent) { throw "no part of $Path exists" }
+        $remainder.Insert(0, [System.IO.Path]::GetFileName($existing))
+        $existing = $parent
+    }
+    $final = [NorthstarAcceptancePath]::Resolve($existing)
+    if ($final.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) {
+        throw "$Path resolves to a network path"
+    }
+    if ($final.StartsWith('\\?\')) { $final = $final.Substring(4) }
+    if ($final -notmatch '^[A-Za-z]:\\') { throw "$Path resolves to $final, which is not a drive path" }
+    foreach ($part in $remainder) { $final = [System.IO.Path]::Combine($final, $part) }
+    return $final
+}
+
+function Get-AcceptancePathRefusal([string] $Label, [string] $Raw) {
+    # The text as given: a local drive path, nothing that needs interpreting.
+    if ($Raw -match '^[\\/]{2}') {
+        return "acceptance $Label '$Raw' is a UNC or device path; only local drive paths are allowed"
+    }
+    if ($Raw -notmatch '^[A-Za-z]:[\\/]' -or $Raw.IndexOf(':', 2) -ge 0) {
+        return "acceptance $Label '$Raw' is not an absolute local drive path"
+    }
+    return $null
+}
+
+function Get-AcceptanceRefusal {
+    # Acceptance only, before anything is written or Docker is called. Paths are
+    # compared as resolved, so an alias of a production directory is refused.
+    if ($ProjectName -cnotmatch $AcceptanceProjectPattern) {
+        return ("project name '{0}' is neither the production default nor an acceptance " -f $ProjectName) +
+            'name (northstar-india-acceptance-<id>)'
+    }
+    foreach ($name in @('DeploymentDirectory', 'LogDirectory')) {
+        if (-not $BoundAtStart.ContainsKey($name)) {
+            return "an acceptance run must pass -$name explicitly; its default is production's"
+        }
+    }
+    $given = [ordered]@{ 'deployment directory' = $DeploymentDirectory; 'log directory' = $LogDirectory }
+    foreach ($label in $given.Keys) {
+        $refusal = Get-AcceptancePathRefusal $label $given[$label]
+        if ($refusal) { return $refusal }
+    }
+    $resolved = [ordered]@{}
+    foreach ($label in $given.Keys) {
+        try {
+            $resolved[$label] = Resolve-AcceptancePath $given[$label]
+        } catch {
+            return "acceptance $label '$($given[$label])' could not be resolved safely: $($_.Exception.Message)"
+        }
+        if ([System.IO.DriveInfo]::new($resolved[$label].Substring(0, 1)).DriveType -ne 'Fixed') {
+            return "acceptance $label $($resolved[$label]) is not on a local fixed drive"
+        }
+    }
+    $production = @(
+        @('deployment directory', (Resolve-AcceptancePath (Join-Path $PSScriptRoot '..'))),
+        @('log directory', (Resolve-AcceptancePath (Join-Path $env:LOCALAPPDATA 'Northstar\india-operations'))),
+        @('log directory', (Resolve-AcceptancePath (
+            Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Northstar\india-operations')))
+    )
+    foreach ($label in $resolved.Keys) {
+        foreach ($entry in $production) {
+            if (Test-PathOverlap $resolved[$label] $entry[1]) {
+                return "acceptance $label $($resolved[$label]) overlaps the production $($entry[0]) $($entry[1])"
+            }
+        }
+    }
+    # Whatever the path, never replace a status file this session did not write.
+    $existingStatus = [System.IO.Path]::Combine($resolved['log directory'], 'last-run.json')
+    if ([System.IO.File]::Exists($existingStatus)) {
+        $owner = $null
+        try {
+            $owner = Get-Field ([System.IO.File]::ReadAllText($existingStatus) | ConvertFrom-Json) 'projectName'
+        } catch {
+            $owner = $null
+        }
+        if (-not ($owner -is [string]) -or $owner -cne $ProjectName) {
+            return ("acceptance log directory {0} already holds a last-run.json that is not from {1} " -f
+                $resolved['log directory'], $ProjectName) + "(production's, another session's or unreadable)"
+        }
+    }
+    return $null
+}
+
+function Get-Field($Object, [string] $Name) {
+    if ($null -eq $Object) { return $null }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
+
+function Get-Fields($Object) {
+    if ($null -eq $Object) { return @() }
+    return @($Object.PSObject.Properties)
+}
+
+function Test-Set($Value) {
+    # In force: Compose renders a setting that is not as absent, null, false or empty.
+    if ($null -eq $Value) { return $false }
+    if ($Value -is [bool]) { return $Value }
+    if ($Value -is [string]) { return $Value.Length -gt 0 }
+    if ($Value -is [System.Management.Automation.PSCustomObject]) {
+        return @($Value.PSObject.Properties).Count -gt 0
+    }
+    if ($Value -is [System.Array]) { return $Value.Count -gt 0 }
+    return $true
+}
+
+function Get-SetFields($Object) {
+    return @(Get-Fields $Object | Where-Object { Test-Set $_.Value })
+}
+
+function Get-AcceptanceModelProblems([string] $Json) {
+    # An allowlist: every setting in force must be one acceptance needs, so an
+    # unknown or newer Compose key is refused, not overlooked. A session-prefixed
+    # name alone proves nothing (a local volume can bind any path through its
+    # driver options), so the backing configuration is checked too. Names only
+    # in messages: environment values are never repeated.
+    $topLevelKeys = @('name', 'services', 'volumes', 'networks')
+    $serviceKeys = @('image', 'pull_policy', 'command', 'entrypoint', 'environment', 'volumes', 'networks')
+    $mountKeys = @('type', 'source', 'target', 'read_only')
+    $credentialPattern = 'UPSTOX|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH|API_?KEY|ACCESS_?KEY'
+    $problems = New-Object System.Collections.Generic.List[string]
+    try {
+        $model = $Json | ConvertFrom-Json
+    } catch {
+        return @('the rendered Compose model is not JSON')
+    }
+    if ((Get-Field $model 'name') -cne $ProjectName) {
+        $problems.Add("the rendered project is not $ProjectName")
+    }
+    foreach ($field in Get-SetFields $model) {
+        if ($topLevelKeys -cnotcontains $field.Name) { $problems.Add("top-level $($field.Name) are not allowed") }
+    }
+    $prefix = "$ProjectName-"
+    $volumeKeys = @{}
+    foreach ($volume in Get-Fields (Get-Field $model 'volumes')) {
+        $volumeKeys[$volume.Name] = $true
+        $name = [string] (Get-Field $volume.Value 'name')
+        if (-not $name.StartsWith($prefix, [StringComparison]::Ordinal)) {
+            $problems.Add("volume '$($volume.Name)' is named '$name', not $prefix<name>")
+        }
+        if ($ProductionVolumeNames -contains $name) { $problems.Add("volume '$name' is a production volume") }
+        foreach ($field in Get-SetFields $volume.Value) {
+            switch -CaseSensitive ($field.Name) {
+                'name' { }
+                'driver' {
+                    if ($field.Value -cne 'local') { $problems.Add("volume '$name' uses driver '$($field.Value)'; only local is allowed") }
+                }
+                'external' { $problems.Add("volume '$name' is external") }
+                'driver_opts' { $problems.Add("volume '$name' sets driver_opts, which can alias other storage under a session name") }
+                default { $problems.Add("volume '$name' sets $($field.Name), which acceptance does not allow") }
+            }
+        }
+    }
+    $networkKeys = @{}
+    foreach ($network in Get-Fields (Get-Field $model 'networks')) {
+        $networkKeys[$network.Name] = $true
+        $name = [string] (Get-Field $network.Value 'name')
+        if (-not $name.StartsWith($prefix, [StringComparison]::Ordinal)) {
+            $problems.Add("network '$($network.Name)' is named '$name', not $prefix<name>")
+        }
+        if (-not (Test-Set (Get-Field $network.Value 'internal'))) {
+            $problems.Add("network '$name' is not internal")
+        }
+        foreach ($field in Get-SetFields $network.Value) {
+            switch -CaseSensitive ($field.Name) {
+                'name' { }
+                'internal' { }
+                'driver' {
+                    if ($field.Value -cne 'bridge') { $problems.Add("network '$name' uses driver '$($field.Value)'; only bridge is allowed") }
+                }
+                'external' { $problems.Add("network '$name' is external") }
+                'driver_opts' { $problems.Add("network '$name' sets driver_opts, which acceptance does not allow") }
+                default { $problems.Add("network '$name' sets $($field.Name), which acceptance does not allow") }
+            }
+        }
+    }
+    $services = @(Get-Fields (Get-Field $model 'services'))
+    if (-not @($services | Where-Object { $_.Name -ceq $Service })) {
+        $problems.Add("service $Service is not defined")
+    }
+    foreach ($entry in $services) {
+        $definition = $entry.Value
+        $label = "service '$($entry.Name)'"
+        foreach ($field in Get-SetFields $definition) {
+            if ($serviceKeys -cnotcontains $field.Name) {
+                $problems.Add("$label sets $($field.Name), which acceptance does not allow")
+            }
+        }
+        if ((Get-Field $definition 'image') -cne $Image) { $problems.Add("$label does not use $Image") }
+        if ((Get-Field $definition 'pull_policy') -cne 'never') { $problems.Add("$label is not pull_policy never") }
+        foreach ($mount in @(Get-Field $definition 'volumes')) {
+            if ($null -eq $mount) { continue }
+            $type = [string] (Get-Field $mount 'type')
+            $source = [string] (Get-Field $mount 'source')
+            $target = [string] (Get-Field $mount 'target')
+            if ($type -cne 'volume' -or -not $volumeKeys.ContainsKey($source)) {
+                $problems.Add("$label mounts $type '$source' at '$target'; only session volumes are allowed")
+            }
+            if ($source -match 'docker\.sock' -or $target -match 'docker\.sock') {
+                $problems.Add("$label mounts the Docker socket")
+            }
+            foreach ($field in Get-SetFields $mount) {
+                if ($mountKeys -cnotcontains $field.Name) {
+                    $problems.Add("$label mount at '$target' sets $($field.Name), which acceptance does not allow")
+                }
+            }
+        }
+        foreach ($variable in Get-Fields (Get-Field $definition 'environment')) {
+            if ($variable.Name -match $credentialPattern) {
+                $problems.Add("$label passes provider credential variable $($variable.Name)")
+            } elseif ($variable.Name -cnotmatch '^NORTHSTAR_[A-Z0-9_]+$') {
+                $problems.Add("$label passes variable $($variable.Name), which acceptance does not allow")
+            }
+        }
+        $attached = @(Get-Fields (Get-Field $definition 'networks'))
+        if ($attached.Count -eq 0) { $problems.Add("$label is not attached to a session network") }
+        foreach ($network in $attached) {
+            if (-not $networkKeys.ContainsKey($network.Name)) {
+                $problems.Add("$label joins network '$($network.Name)' that is not session-owned")
+            }
+            if (Test-Set $network.Value) {
+                $problems.Add("$label joins network '$($network.Name)' with attachment settings")
+            }
+        }
+    }
+    return $problems.ToArray()
+}
+
 function Invoke-Operation {
     $deployment = [System.IO.Path]::GetFullPath($DeploymentDirectory)
     $composeFile = Join-Path $deployment 'compose.yaml'
@@ -359,6 +677,11 @@ function Invoke-Operation {
 
     Write-RunLog 'INFO' "run $RunId started by $env:USERDOMAIN\$env:USERNAME on $env:COMPUTERNAME"
     Write-RunLog 'INFO' "deployment directory: $deployment"
+    if ($IsAcceptance) {
+        Write-RunLog 'INFO' "compose project: $ProjectName (isolated acceptance; production project, paths and volumes are refused)"
+    } else {
+        Write-RunLog 'INFO' "compose project: $ProjectName"
+    }
     Write-RunLog 'INFO' "container: $ContainerName; timeout: $TimeoutSeconds s; log retention: $LogRetentionDays day(s)"
 
     # 1. Deployment files. Nothing is read from .env except two non-secret settings.
@@ -431,6 +754,18 @@ function Invoke-Operation {
             "run 'docker compose config --quiet' in the deployment directory to see why"
         )
     }
+    if ($IsAcceptance) {
+        # Acceptance only: the production path never runs this inspection.
+        $rendered = Invoke-Docker ($composeBase + @('config', '--format', 'json')) $PreflightTimeoutSeconds
+        if ($rendered.TimedOut -or $rendered.ExitCode -ne 0) {
+            return Set-Failure $ExitDeploymentInvalid 'acceptance: the rendered Compose model could not be inspected; refusing to run'
+        }
+        $problems = @(Get-AcceptanceModelProblems $rendered.Stdout)
+        if ($problems.Count -gt 0) {
+            return Set-Failure $ExitDeploymentInvalid ('acceptance configuration refused: ' + ($problems -join '; '))
+        }
+        Write-RunLog 'INFO' 'acceptance isolation verified: session-owned volumes and internal networks only'
+    }
     $imageCheck = Invoke-Docker @('image', 'inspect', '--format', '{{.Id}}', $Image) $PreflightTimeoutSeconds
     if ($imageCheck.TimedOut -or $imageCheck.ExitCode -ne 0) {
         return Set-Failure $ExitDeploymentInvalid "image $Image is not built on this host; build it with 'docker compose build'"
@@ -481,6 +816,21 @@ function Invoke-Operation {
         $Status.reason = 'the operation exited 0 without a recognised status line'
     }
     return $code
+}
+
+if ($IsAcceptance) {
+    # Fail closed before any file is written or Docker is called. The production
+    # default never takes this branch.
+    $refusal = $null
+    try {
+        $refusal = Get-AcceptanceRefusal
+    } catch {
+        $refusal = "the acceptance safety check could not complete: $($_.Exception.Message)"
+    }
+    if ($refusal) {
+        [Console]::Error.WriteLine("REFUSED (exit $ExitDeploymentInvalid): $refusal. No log or status file was written and Docker was not called.")
+        exit $ExitDeploymentInvalid
+    }
 }
 
 $exitCode = $ExitWrapperError
