@@ -13,6 +13,7 @@ from __future__ import annotations
 import io
 import sqlite3
 import threading
+from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -547,26 +548,44 @@ def test_dashboard_reads_during_the_daily_write_stay_consistent(tmp_path: Path) 
         target=FuturesContractCount(1),
     )
     app = create_app(settings, runtime=build_database_runtime(scheduler.database))
-    done, statuses = threading.Event(), []
+    reading, done = threading.Event(), threading.Event()
+    attempts, statuses, errors = [0], [], []
 
     def read() -> None:
-        while not done.is_set():
-            statuses.append(_get(app, "/futures/dashboard").status)
+        # Every attempt is accounted for: a status or the exception that replaced
+        # it. A reader that raised must fail the test, not merely stop sampling.
+        try:
+            while True:
+                attempts[0] += 1
+                try:
+                    statuses.append(_get(app, "/futures/dashboard").status)
+                except BaseException as error:  # noqa: BLE001 - reported below
+                    errors.append(f"{type(error).__name__}: {error}")
+                reading.set()
+                if done.is_set():
+                    return
+        finally:
+            reading.set()
 
-    reader = threading.Thread(target=read)
+    reader = threading.Thread(target=read, daemon=True)
     reader.start()
     try:
+        assert reading.wait(timeout=60), "the dashboard reader never completed a request"
         run = scheduler.daily(_after(25))
     finally:
         done.set()
-        reader.join()
+        reader.join(timeout=60)
 
+    assert not reader.is_alive(), "the dashboard reader did not finish"
+    assert errors == []
+    assert len(statuses) == attempts[0] >= 2
+    assert set(statuses) == {200}
     assert run.code == ExitCode.SUCCESS
-    assert statuses and set(statuses) == {200}
     final = _get(app, "/futures/dashboard").json
     assert final["paper"]["order_state"] == "no_order"
     assert final["portfolio"]["positions"][0]["average_entry"] == "7650"
-    with sqlite3.connect(scheduler.database) as connection:
+    # closing(): a sqlite3 connection's own context manager commits but never closes.
+    with closing(sqlite3.connect(scheduler.database)) as connection:
         assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
         assert connection.execute("PRAGMA journal_mode").fetchone() == ("delete",)
 
