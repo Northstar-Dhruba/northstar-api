@@ -117,6 +117,7 @@ from northstar_application.application_services import (
     AcquireFuturesDailyHistoryUseCase,
     BuildOptionChainSnapshotUseCase,
     ForwardResearchContractViolationError,
+    FuturesCandleApprovalError,
     FuturesContractEconomicsContractViolationError,
     FuturesContractEconomicsNotFoundError,
     FuturesDailyAcquisitionResult,
@@ -126,7 +127,9 @@ from northstar_application.application_services import (
     FuturesPaperPortfolioStrategyConflictError,
     FuturesPaperTradingContractViolationError,
     FuturesPaperTradingSessionResult,
+    FuturesReviewedCandleVerification,
     GetOptionContractEconomicsUseCase,
+    InvalidFuturesCandleApprovalSetError,
     InvalidFuturesPaperFillHistoryError,
     OptionChainContractViolationError,
     OptionChainListingNotKnownError,
@@ -137,6 +140,7 @@ from northstar_application.application_services import (
     OptionDailyAcquisitionResult,
     OptionDailySessionCoverageError,
     OptionHistoricalDataContractViolationError,
+    futures_daily_candle_fingerprint,
 )
 from northstar_application.ports import (
     FuturesContractEconomicsConflictError,
@@ -144,6 +148,7 @@ from northstar_application.ports import (
     FuturesForwardResearchRecordConflictError,
     FuturesForwardResearchRecordQuery,
     FuturesHistoricalMarketDataConflictError,
+    FuturesHistoricalMarketDataQuery,
     FuturesPaperFillConflictError,
     FuturesPaperOrderConflictError,
     FuturesSessionResolutionError,
@@ -229,6 +234,7 @@ from northstar_api.operations import (
     plan_session_backlog,
 )
 from northstar_api.operations_lock import DatabaseOperationsLock, OperationsAlreadyActiveError
+from northstar_api.reviewed_candle_protection import is_protected, protect
 from northstar_api.runtime import (
     DatabaseConfigurationError,
     DatabaseRuntime,
@@ -247,6 +253,7 @@ from northstar_api.runtime import (
     build_upstox_market_sync_runtime,
 )
 from northstar_api.settings import (
+    APPROVED_CANDLES_VARIABLE,
     DAILY_BAR_FINALITY_VARIABLE,
     FINAL_THROUGH_VARIABLE,
     GO_LIVE_VARIABLE,
@@ -257,6 +264,7 @@ from northstar_api.settings import (
     FuturesMarketDataProvider,
     FuturesOperationSettings,
     FuturesSessionOperationSettings,
+    load_candle_approvals,
     load_market_data_provider,
     load_operation_settings,
     load_session_operation_settings,
@@ -287,6 +295,9 @@ class ExitCode(IntEnum):
     # The operated contract is past expiry, or out of sessions, while a position
     # or pending order remains in it. Nothing is settled, cancelled or rolled.
     EXPIRY_EXCEPTION = 7
+    # A candle is not the version an operator approved, or a session to be
+    # acquired or decided has no approved version. Nothing was stored.
+    CANDLE_APPROVAL = 8
 
 
 class CommandError(Exception):
@@ -778,7 +789,11 @@ def _api_key(context: _Context, command: str) -> str:
 
 
 def _market_acquisition(
-    context: _Context, provider: FuturesMarketDataProvider, database: Path, command: str
+    context: _Context,
+    provider: FuturesMarketDataProvider,
+    database: Path,
+    command: str,
+    reviewed_candles: FuturesReviewedCandleVerification | None = None,
 ) -> tuple[FuturesDailyAcquisition, str]:
     """Compose the selected provider's acquisition path and its failure note.
 
@@ -788,6 +803,13 @@ def _market_acquisition(
     """
     if provider is FuturesMarketDataProvider.UPSTOX:
         token = _secret(context, UPSTOX_TOKEN_VARIABLE, "Upstox", command)
+        if reviewed_candles is not None:
+            return (
+                context.upstox_market_sync_runtime(
+                    database, token, reviewed_candles=reviewed_candles
+                ),
+                _SYNC_NOTHING_STORED,
+            )
         return context.upstox_market_sync_runtime(database, token), _SYNC_NOTHING_STORED
     api_key = _api_key(context, command)
     return context.market_sync_runtime(database, api_key), _SYNC_PARTIAL
@@ -824,6 +846,16 @@ def _acquire(
         raise CommandError(
             ExitCode.STATE, f"{type(error).__name__}: {error}\nSync stopped. {stopped}"
         ) from error
+    except FuturesCandleApprovalError as error:
+        # Missing or mismatched approved candle version: refused before any write.
+        raise CommandError(
+            ExitCode.CANDLE_APPROVAL,
+            f"{type(error).__name__}: {error}\nSync stopped. {stopped}",
+        ) from error
+    except InvalidFuturesCandleApprovalSetError as error:
+        raise CommandError(
+            ExitCode.CONFIGURATION, f"{type(error).__name__}: {error}\nSync stopped. {stopped}"
+        ) from error
 
 
 def _market_data_sync(args: argparse.Namespace, context: _Context) -> ExitCode:
@@ -836,10 +868,18 @@ def _market_data_sync(args: argparse.Namespace, context: _Context) -> ExitCode:
         lambda _: FuturesDailyHistoricalAcquisitionQuery(contract, start, end),
     )
     provider = FuturesMarketDataProvider(args.provider)
+    session_settings: FuturesSessionOperationSettings | None = None
+    reviewed: FuturesReviewedCandleVerification | None = None
+    if _is_nse(contract):
+        _refuse_databento_for_nse(provider, contract, "market-data sync")
+        session_settings = _configured(lambda: load_session_operation_settings(context.env))
+        reviewed = _nse_sync_verification(session_settings, contract)
 
     with DatabaseOperationsLock(_database(args)):
+        if session_settings is not None:
+            _require_protection_mode(_database(args), contract, session_settings)
         acquisition, stopped = _market_acquisition(
-            context, provider, _database(args), "market-data sync"
+            context, provider, _database(args), "market-data sync", reviewed
         )
         context.write(
             [
@@ -1013,17 +1053,166 @@ def _refuse_backward_run(
         )
 
 
+# ---------------------------------------------------------------------------
+# Reviewed-candle guards for NSE futures (FG-9)
+# ---------------------------------------------------------------------------
+
+_OPERATED_MODES = frozenset(
+    {FuturesDailyBarFinalityMode.OPERATOR_APPROVED, FuturesDailyBarFinalityMode.OPERATOR_REVIEWED}
+)
+
+
+def _is_nse(contract: FuturesContract) -> bool:
+    return contract.product.exchange_code.value == _CHRONOLOGICAL_VENUE
+
+
+def _refuse_databento_for_nse(
+    provider: FuturesMarketDataProvider, contract: FuturesContract, command: str
+) -> None:
+    """Databento never serves NSE futures here, even as the unset default."""
+    if provider is FuturesMarketDataProvider.DATABENTO and _is_nse(contract):
+        raise CommandError(
+            ExitCode.CONFIGURATION,
+            f"{command} refuses Databento for {contract}: NSE futures are acquired only from "
+            f"Upstox ({MARKET_DATA_PROVIDER_VARIABLE}=upstox, or --provider upstox). Databento "
+            "is also the default when no provider is set. Nothing was acquired.",
+        )
+
+
+def _require_protection_mode(
+    database: Path, contract: FuturesContract, settings: FuturesSessionOperationSettings
+) -> None:
+    """OD-9: keep a protected file protected whatever this process's configuration says.
+
+    An operated mode marks the file before anything else is written. Any other
+    mode -- including a missing or blank one -- is refused on a marked file.
+    """
+    exchange = contract.product.exchange_code
+    mode = settings.finality_mode
+    if mode in _OPERATED_MODES:
+        protect(database, exchange, mode.value)
+        return
+    if is_protected(database, exchange):
+        raise CommandError(
+            ExitCode.CONFIGURATION,
+            f"This database requires reviewed candles for {exchange} futures, but "
+            f"{DAILY_BAR_FINALITY_VARIABLE} is {mode.value}; set it to operator-reviewed with "
+            f"{APPROVED_CANDLES_VARIABLE}. Nothing was written.",
+        )
+
+
+def _nse_sync_verification(
+    settings: FuturesSessionOperationSettings, contract: FuturesContract
+) -> FuturesReviewedCandleVerification | None:
+    """The verification a manual NSE Upstox sync must run with, or None when unoperated."""
+    mode = settings.finality_mode
+    if mode is FuturesDailyBarFinalityMode.OPERATOR_REVIEWED:
+        return FuturesReviewedCandleVerification(
+            _configured(lambda: load_candle_approvals(settings, contract.product))
+        )
+    if mode is FuturesDailyBarFinalityMode.OPERATOR_APPROVED:
+        raise CommandError(
+            ExitCode.CONFIGURATION,
+            f"{DAILY_BAR_FINALITY_VARIABLE}=operator-approved does not authorize acquiring NSE "
+            f"candles: set it to operator-reviewed with {APPROVED_CANDLES_VARIABLE}. "
+            "Nothing was acquired.",
+        )
+    return None
+
+
+def _guard_nse_paper_session(
+    context: _Context,
+    runtime: DatabaseRuntime,
+    database: Path,
+    contract: FuturesContract,
+    strategy: StrategyIdentity,
+    as_of: PointInTime,
+) -> None:
+    """Refuse a paper session that would consume an unapproved or unverified NSE bar.
+
+    The sessions a run up to ``as_of`` newly consumes are those after the
+    latest frozen decision (or from go-live) whose close is at or before
+    ``as_of``. They must all be final under the configured policy; in
+    operator-reviewed mode each one's stored bar must also be its approved
+    version. Nothing here fetches from a provider or writes anything.
+    """
+    settings = _configured(lambda: load_session_operation_settings(context.env))
+    _require_protection_mode(database, contract, settings)
+    mode = settings.finality_mode
+    if mode is FuturesDailyBarFinalityMode.DISABLED:
+        return  # an unprotected development file, operated by hand as before
+    latest = latest_frozen_decision(runtime.forward_repository, contract, strategy)
+    try:
+        backlog = plan_session_backlog(
+            NSEFuturesTradingSessionResolver(),
+            build_daily_bar_finality_policy(settings),
+            contract,
+            latest,
+            settings.go_live,
+        )
+    except FuturesOperationConfigurationError as error:
+        raise CommandError(ExitCode.CONFIGURATION, str(error)) from error
+    waiting = backlog.waiting_on
+    if waiting is not None and not _is_before(as_of, waiting.session.closes_at):
+        raise CommandError(
+            ExitCode.STATE,
+            f"Paper run refused: cutoff {as_of} reaches session "
+            f"{waiting.session.trading_date.isoformat()}, which is not approved as final "
+            f"({waiting.reason}). Nothing was decided.",
+        )
+    needed = tuple(s for s in backlog.eligible if not _is_before(as_of, s.closes_at))
+    if not needed:
+        return
+    if mode is not FuturesDailyBarFinalityMode.OPERATOR_REVIEWED:
+        raise CommandError(
+            ExitCode.CONFIGURATION,
+            f"{DAILY_BAR_FINALITY_VARIABLE}={mode.value} does not authorize deciding sessions "
+            f"{needed[0].trading_date} .. {needed[-1].trading_date}: set it to "
+            f"operator-reviewed with {APPROVED_CANDLES_VARIABLE}. Nothing was decided.",
+        )
+    approvals = _configured(lambda: load_candle_approvals(settings, contract.product))
+    approvals.require_approvals(contract, (s.trading_date for s in needed))
+    fingerprints: dict[date, str] = {}
+    unstored: list[date] = []
+    for session in needed:
+        stored = runtime.market_repository.get_bars(
+            FuturesHistoricalMarketDataQuery(contract, _DAILY, session.closes_at, session.closes_at)
+        )
+        if not stored:
+            unstored.append(session.trading_date)
+            continue
+        fingerprints[session.trading_date] = futures_daily_candle_fingerprint(
+            contract, session.trading_date, stored[0]
+        )
+    if unstored:
+        raise CommandError(
+            ExitCode.CANDLE_APPROVAL,
+            f"Paper run refused: no stored bar for approved {contract} sessions "
+            + ", ".join(d.isoformat() for d in unstored)
+            + ". Nothing was decided.",
+        )
+    approvals.verify_fingerprints(contract, fingerprints)
+
+
 def _run_paper_session(
     context: _Context,
     runtime: DatabaseRuntime,
+    database: Path,
     contract: FuturesContract,
     strategy: StrategyIdentity,
     portfolio: PaperPortfolioIdentity,
     target: FuturesContractCount,
     as_of: PointInTime,
 ) -> tuple[FuturesPaperTradingSessionResult, bool]:
-    """Run and render one paper session; return it and whether P&L was available."""
+    """Run and render one paper session; return it and whether P&L was available.
+
+    Every caller -- manual ``paper run``, the latest-cutoff replay, the
+    chronological loop and the Databento cycle -- passes the NSE paper guard
+    here, before anything is decided, ordered or filled.
+    """
     _refuse_backward_run(runtime, contract, strategy, as_of)
+    if _is_nse(contract):
+        _guard_nse_paper_session(context, runtime, database, contract, strategy, as_of)
     context.warn(_TARGET_WARNING)
 
     # The contract's own venue selects the session, and with it any pre-expiry guard.
@@ -1072,7 +1261,7 @@ def _paper_run(args: argparse.Namespace, context: _Context) -> ExitCode:
     with DatabaseOperationsLock(_database(args)):
         runtime = context.database_runtime(_database(args))
         _, valued = _run_paper_session(
-            context, runtime, contract, strategy, portfolio, target, as_of
+            context, runtime, _database(args), contract, strategy, portfolio, target, as_of
         )
     return ExitCode.SUCCESS if valued else ExitCode.DATA
 
@@ -1143,12 +1332,20 @@ def _daily_operation(
     secret are checked before the lock.
 
     With finality disabled nothing can be acquired, so the Upstox secret is
-    neither required nor read; only operator-approved finality needs it.
+    neither required nor read; only the operated modes need it.
+
+    An NSE contract is never operated through Databento, including when
+    Databento is only the default provider: that is refused here, before any
+    secret is read, provider is built or file is opened.
     """
     settings = _configured(lambda: load_operation_settings(context.env))
     provider = _configured(lambda: load_market_data_provider(context.env))
+    _refuse_databento_for_nse(provider, settings.contract, "operations daily")
     if provider is FuturesMarketDataProvider.UPSTOX:
         session_settings = _configured(lambda: load_session_operation_settings(context.env))
+        if session_settings.finality_mode is FuturesDailyBarFinalityMode.OPERATOR_REVIEWED:
+            # A malformed manifest is refused before the lock, the file or any request.
+            _configured(lambda: load_candle_approvals(session_settings, settings.contract.product))
         venue = settings.contract.product.exchange_code.value
         if venue != _CHRONOLOGICAL_VENUE:
             raise CommandError(
@@ -1158,7 +1355,7 @@ def _daily_operation(
             )
         token = (
             _secret(context, UPSTOX_TOKEN_VARIABLE, "Upstox", "operations daily")
-            if session_settings.finality_mode is FuturesDailyBarFinalityMode.OPERATOR_APPROVED
+            if session_settings.finality_mode.uses_final_through
             else None
         )
         # One lock for the whole cycle -- backlog, finality, sync and every session.
@@ -1171,7 +1368,7 @@ def _daily_operation(
 
 
 def _finality_line(settings: FuturesSessionOperationSettings) -> str:
-    if settings.finality_mode is FuturesDailyBarFinalityMode.OPERATOR_APPROVED:
+    if settings.finality_mode.uses_final_through:
         return (
             f"Finality mode: {settings.finality_mode.value} "
             f"(final through {settings.final_through.isoformat()})"
@@ -1209,6 +1406,7 @@ def _replay_latest_cutoff(
     _run_paper_session(
         quiet,
         runtime,
+        settings.database,
         settings.contract,
         settings.strategy,
         settings.portfolio,
@@ -1295,6 +1493,8 @@ def _chronological_daily_operation(
     log.info("%s", _finality_line(session_settings).lower())
 
     runtime = context.database_runtime(settings.database)
+    # OD-9: a protected file refuses a weaker configuration before anything else.
+    _require_protection_mode(settings.database, contract, session_settings)
     latest = latest_frozen_decision(runtime.forward_repository, contract, settings.strategy)
     try:
         backlog = plan_session_backlog(
@@ -1366,6 +1566,18 @@ def _chronological_daily_operation(
         return FuturesChronologicalOperationResult(contract, backlog, 0, (), True)
 
     first, last = backlog.eligible[0].trading_date, backlog.eligible[-1].trading_date
+    if session_settings.finality_mode is not FuturesDailyBarFinalityMode.OPERATOR_REVIEWED:
+        # A final-through date alone never approves provider values.
+        raise CommandError(
+            ExitCode.CONFIGURATION,
+            f"{DAILY_BAR_FINALITY_VARIABLE}={session_settings.finality_mode.value} does not "
+            f"authorize acquiring or deciding sessions {first} .. {last}: set it to "
+            f"operator-reviewed with {APPROVED_CANDLES_VARIABLE} naming each approved candle "
+            "version. Nothing was acquired.",
+        )
+    reviewed = FuturesReviewedCandleVerification(
+        _configured(lambda: load_candle_approvals(session_settings, contract.product))
+    )
     if token is None:
         # Unreachable by design: only operator-approved finality yields final
         # sessions, and that mode always reads the token. Fail closed regardless.
@@ -1379,7 +1591,9 @@ def _chronological_daily_operation(
     if now is None:
         now = context.clock()
     captured_instant(now)  # refuses a naive instant
-    acquisition = context.upstox_market_sync_runtime(settings.database, token, current_instant=now)
+    acquisition = context.upstox_market_sync_runtime(
+        settings.database, token, current_instant=now, reviewed_candles=reviewed
+    )
     acquired = _acquire(
         acquisition,
         FuturesDailyHistoricalAcquisitionQuery(contract, first, last),
@@ -1406,6 +1620,7 @@ def _chronological_daily_operation(
             result, valued = _run_paper_session(
                 context,
                 runtime,
+                settings.database,
                 contract,
                 settings.strategy,
                 settings.portfolio,
@@ -1496,6 +1711,7 @@ def _daily_operation_cycle(
     session, valued = _run_paper_session(
         context,
         runtime,
+        settings.database,
         contract,
         settings.strategy,
         settings.portfolio,
@@ -1780,8 +1996,10 @@ def build_parser() -> argparse.ArgumentParser:
             "treats as final; once such sessions exist it reads the clock once, only to fetch\n"
             "the venue's current date from Upstox's current-day endpoint:\n"
             f"  {UPSTOX_TOKEN_VARIABLE}  (secret; never echoed)\n"
-            f"  {DAILY_BAR_FINALITY_VARIABLE}  disabled (default) or operator-approved\n"
-            f"  {FINAL_THROUGH_VARIABLE}  last approved trading date (operator-approved)\n"
+            f"  {DAILY_BAR_FINALITY_VARIABLE}  disabled (default), operator-approved or\n"
+            "      operator-reviewed; only operator-reviewed acquires or decides NSE sessions\n"
+            f"  {FINAL_THROUGH_VARIABLE}  last approved trading date (unless disabled)\n"
+            f"  {APPROVED_CANDLES_VARIABLE}  approved candle versions (operator-reviewed)\n"
             f"  {GO_LIVE_VARIABLE}  first session to operate while no decision is frozen"
         ),
     )
@@ -1859,6 +2077,10 @@ def _classify(error: Exception) -> tuple[ExitCode, str]:
         return ExitCode.CONFIGURATION, str(error)
     if isinstance(error, OperationsAlreadyActiveError):
         return ExitCode.STATE, str(error)
+    if isinstance(error, FuturesCandleApprovalError):
+        return ExitCode.CANDLE_APPROVAL, f"{type(error).__name__}: {error}"
+    if isinstance(error, InvalidFuturesCandleApprovalSetError):
+        return ExitCode.CONFIGURATION, f"{type(error).__name__}: {error}"
     if isinstance(
         error, FuturesTradingSessionInProgressError | FuturesContractEconomicsNotFoundError
     ):

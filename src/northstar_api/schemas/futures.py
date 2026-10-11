@@ -159,7 +159,7 @@ class FinalityResponse(BaseModel):
     required session, or None when there is no such session.
     """
 
-    mode: Literal["disabled", "operator-approved"]
+    mode: Literal["disabled", "operator-approved", "operator-reviewed"]
     final_through: str | None
     next_session_outcome: Literal["FINAL", "NOT_YET_FINAL", "UNKNOWN"] | None
     next_session_reason: str | None

@@ -139,7 +139,7 @@ def test_v1_post_expiry_waiting_with_an_open_position_is_an_expiry_exception(tmp
 
     _assert_expiry_exception(run, position="OPEN LONG 1", pending=0)
     assert "is past its expiration date (India date 2026-11-02)" in run.out
-    assert "Finality mode: operator-approved (final through" in run.out
+    assert "Finality mode: operator-reviewed (final through" in run.out
     assert clock.reads == 1
     assert op.facts() == before
     assert _requests_after(op, requests) == [] and op.upstox.current_day_requests == 0
