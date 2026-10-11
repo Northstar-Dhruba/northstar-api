@@ -19,6 +19,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: northstar-api
+          # Full history of every branch: the FG-9 rollback tests read pre-FG-9
+          # baselines (on main and develop) with git show.
+          fetch-depth: 0
 
       - name: Checkout northstar-core
         uses: actions/checkout@v4
