@@ -442,12 +442,17 @@ def _aggregate(sessions: tuple[SessionEvidence, ...]) -> EvidenceAggregate:
     )
 
 
+def parse_observations(records: Sequence[dict[str, Any]]) -> tuple[EvidenceObservation, ...]:
+    """Parse every record in file order, line numbers from 1; any defect refuses all."""
+    return tuple(_observation(record, line) for line, record in enumerate(records, start=1))
+
+
 def build_report(
     records: Sequence[dict[str, Any]],
     filters: EvidenceFilters = EvidenceFilters(),  # noqa: B008 - immutable
 ) -> FinalityEvidenceReport:
     """Derive the report from records in file order; line numbers start at 1."""
-    observations = [_observation(record, line) for line, record in enumerate(records, start=1)]
+    observations = parse_observations(records)
     grouped: dict[EvidenceSessionKey, list[EvidenceObservation]] = {}
     for observation in observations:
         if filters.matches(observation.key):

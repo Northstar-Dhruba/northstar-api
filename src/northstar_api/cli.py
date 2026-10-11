@@ -130,6 +130,7 @@ from northstar_application.application_services import (
     FuturesReviewedCandleVerification,
     GetOptionContractEconomicsUseCase,
     InvalidFuturesCandleApprovalSetError,
+    InvalidFuturesDailyCandleIdentityError,
     InvalidFuturesPaperFillHistoryError,
     OptionChainContractViolationError,
     OptionChainListingNotKnownError,
@@ -158,17 +159,20 @@ from northstar_application.ports import (
     OptionHistoricalMarketDataConflictError,
     OptionTradingSessionResolutionError,
 )
-from northstar_core.derivatives import ExpirationDate
+from northstar_core.derivatives import ExpirationDate, QuoteValue
+from northstar_core.foundation.exceptions.validation import ValidationError
 from northstar_core.foundation.value_objects import (
     Currency,
     ExchangeCode,
     PointInTime,
+    Quantity,
     Symbol,
     Timeframe,
 )
 from northstar_core.futures import (
     FuturesContract,
     FuturesContractEconomics,
+    FuturesOHLCVBar,
     FuturesPointValue,
     FuturesProductReference,
 )
@@ -215,7 +219,12 @@ from northstar_infrastructure.persistence import (
 )
 
 from northstar_api import _cli_rendering as render
-from northstar_api.finality_evidence import EvidenceFilters, build_report, report_lines
+from northstar_api.finality_evidence import (
+    EvidenceFilters,
+    build_report,
+    parse_observations,
+    report_lines,
+)
 from northstar_api.operations import (
     NO_HISTORY,
     FuturesChronologicalOperationResult,
@@ -234,7 +243,13 @@ from northstar_api.operations import (
     plan_session_backlog,
 )
 from northstar_api.operations_lock import DatabaseOperationsLock, OperationsAlreadyActiveError
-from northstar_api.reviewed_candle_protection import is_protected, protect
+from northstar_api.reviewed_candle_protection import (
+    INITIALIZED_MODE,
+    PROTECTION_VERSION,
+    inspect_protection,
+    is_protected,
+    protect,
+)
 from northstar_api.runtime import (
     DatabaseConfigurationError,
     DatabaseRuntime,
@@ -1021,6 +1036,264 @@ def _finality_evidence_report(args: argparse.Namespace, context: _Context) -> Ex
         ) from error
     context.write(report_lines(report, str(evidence), filters))
     return ExitCode.SUCCESS
+
+
+def _finality_evidence_identity(args: argparse.Namespace, context: _Context) -> ExitCode:
+    """Print the fdc1 fingerprint of one evidence record; approves nothing.
+
+    Offline and read-only: only the evidence file and the NSE calendar are
+    read -- no environment, clock, database, manifest or provider. The record
+    must name exactly the requested contract and session; with several such
+    records the operator must choose one by --line. No candle value is printed.
+    """
+    contract = _contract(args)
+    trading_date = _parse("trading date", args.trading_date, _trading_date)
+    if not _is_nse(contract):
+        raise CommandError(ExitCode.INPUT, "Candle identities are produced for NSE futures only.")
+    evidence = Path(args.evidence)
+    if not evidence.is_file():
+        raise CommandError(ExitCode.CONFIGURATION, f"Evidence file not found: {evidence}")
+    try:
+        observations = parse_observations(UpstoxCandleEvidenceLog(evidence).read())
+    except UpstoxCandleEvidenceLogError as error:
+        raise CommandError(ExitCode.STATE, f"{type(error).__name__}: {error}") from error
+    except OSError as error:
+        raise CommandError(
+            ExitCode.CONFIGURATION, f"Evidence file {evidence} cannot be read: {error}"
+        ) from error
+
+    wanted = (
+        contract.product.product_code.value,
+        contract.product.exchange_code.value,
+        contract.expiration_date.value,
+        trading_date,
+    )
+    matching = [
+        o
+        for o in observations
+        if (o.key.product, o.key.exchange, o.key.expiration, o.key.trading_date) == wanted
+    ]
+    label = f"{contract} session {trading_date.isoformat()}"
+    if args.line is not None:
+        selected = [o for o in matching if o.line == args.line]
+        if not selected:
+            raise CommandError(
+                ExitCode.INPUT,
+                f"Evidence line {args.line} is not a record of {label}; nothing was produced.",
+            )
+    else:
+        selected = matching
+    if not selected:
+        raise CommandError(ExitCode.INPUT, f"No evidence record of {label}; nothing was produced.")
+    if len(selected) > 1:
+        choices = ", ".join(
+            f"line {o.line} ({_endpoint(o.requested_at, trading_date)}, requested "
+            f"{o.requested_at.isoformat().replace('+00:00', 'Z')})"
+            for o in selected
+        )
+        raise CommandError(
+            ExitCode.INPUT,
+            f"{len(selected)} evidence records of {label}: {choices}. Choose exactly one with "
+            "--line; nothing was produced.",
+        )
+    record = selected[0]
+    if record.candle is None:
+        raise CommandError(
+            ExitCode.STATE, f"Evidence line {record.line} recorded no candle; nothing was produced."
+        )
+    if record.volume_contracts is None:
+        raise CommandError(
+            ExitCode.STATE,
+            f"Evidence line {record.line} has no whole contract volume; nothing was produced.",
+        )
+    session = NSEFuturesTradingSessionResolver().resolve(contract.product, trading_date)
+    if session is None:
+        raise CommandError(
+            ExitCode.INPUT, f"{trading_date.isoformat()} is not an NSE trading session."
+        )
+    candle = record.candle
+    try:
+        bar = FuturesOHLCVBar(
+            contract=contract,
+            point_in_time=session.closes_at,
+            timeframe=_DAILY,
+            open=QuoteValue(candle.open),
+            high=QuoteValue(candle.high),
+            low=QuoteValue(candle.low),
+            close=QuoteValue(candle.close),
+            volume=Quantity(record.volume_contracts),
+        )
+        fingerprint = futures_daily_candle_fingerprint(contract, trading_date, bar)
+    except (ValidationError, InvalidFuturesDailyCandleIdentityError) as error:
+        raise CommandError(
+            ExitCode.STATE,
+            f"Evidence line {record.line} cannot be given an fdc1 identity: "
+            f"{type(error).__name__}; nothing was produced.",
+        ) from error
+
+    endpoint = _endpoint(record.requested_at, trading_date)
+    key = f"{contract.expiration_date.value}/{trading_date.isoformat()}"
+    lines = [
+        "CANDLE IDENTITY -- NOT AN APPROVAL",
+        f"Contract: {contract}",
+        f"Session: {trading_date.isoformat()}",
+        f"Evidence: {evidence} line {record.line} of {len(observations)}",
+        f"Requested at: {record.requested_at.isoformat().replace('+00:00', 'Z')}",
+        f"Endpoint: {endpoint}",
+        f"Manifest entry: {key}={fingerprint}",
+        "",
+        "This fingerprint identifies one observed candle version and approves nothing.",
+        f"Record the N-4 decision first. Add the entry to {APPROVED_CANDLES_VARIABLE} only under a",
+        "separate, recorded FG-8 authorization. The fingerprint is Upstox-derived (G-1).",
+    ]
+    if endpoint != "historical":
+        lines.insert(
+            7,
+            "WARNING: a same-day observation; acquiring a past session uses the historical "
+            "endpoint, which may serve different values (N-4 RC-2).",
+        )
+    context.write(lines)
+    return ExitCode.SUCCESS
+
+
+def _endpoint(requested_at: datetime, trading_date: date) -> str:
+    """Which Upstox endpoint answered: the collector routes the venue's current date."""
+    return "same-day" if india_calendar_date(requested_at) == trading_date else "historical"
+
+
+# ---------------------------------------------------------------------------
+# protection
+# ---------------------------------------------------------------------------
+
+
+def _protection_exchange(args: argparse.Namespace) -> ExchangeCode:
+    exchange = _parse("exchange", args.exchange, ExchangeCode)
+    if exchange.value != _CHRONOLOGICAL_VENUE:
+        raise CommandError(
+            ExitCode.INPUT, f"Reviewed-candle protection applies to {_CHRONOLOGICAL_VENUE} only."
+        )
+    return exchange
+
+
+def _protection_lines(database: Path, exchange: ExchangeCode, state) -> list[str]:
+    if not state.database_exists:
+        marker = "absent (no database file)"
+    elif not state.marker_table_present:
+        marker = "absent"
+    elif state.valid:
+        marker = "present, valid"
+    else:
+        marker = "present, INVALID: " + "; ".join(state.problems)
+    protected = f"yes (marked by {state.protected_by_mode})" if state.protected else "no"
+    return [
+        f"Database: {database}",
+        f"Exchange: {exchange.value}",
+        f"This build enforces reviewed-candle protection: version {PROTECTION_VERSION}",
+        f"Marker: {marker}",
+        f"Protected: {protected}",
+    ]
+
+
+def _protection_init(args: argparse.Namespace, context: _Context) -> ExitCode:
+    """Mark an existing Northstar database protected; idempotent; verified.
+
+    Run while nothing else can write: the scheduled task disabled and no
+    Northstar container running. The operations lock is held throughout, so a
+    concurrent Northstar writer of this build is refused, not raced. Writes only
+    the marker: no candle, decision, order or fill, and no finality setting.
+    """
+    database = _database(args)
+    exchange = _protection_exchange(args)
+    if not database.is_file():
+        raise CommandError(
+            ExitCode.CONFIGURATION,
+            f"Database not found: {database}. Protection marks an existing database only.",
+        )
+    with DatabaseOperationsLock(database):
+        before = inspect_protection(database, exchange)
+        if not before.futures_schema_present:
+            raise CommandError(
+                ExitCode.CONFIGURATION,
+                f"{database} is not a Northstar futures database; nothing was written.",
+            )
+        if not before.valid:
+            raise CommandError(
+                ExitCode.CONFIGURATION,
+                "Reviewed-candle protection is invalid: "
+                + "; ".join(before.problems)
+                + ". Nothing was written; investigate before any write.",
+            )
+        after = protect(database, exchange, INITIALIZED_MODE)
+    outcome = (
+        "PROTECTION: ALREADY PRESENT -- unchanged"
+        if before.protected
+        else "PROTECTION: INITIALIZED -- verified"
+    )
+    context.write(
+        [
+            "REVIEWED-CANDLE PROTECTION",
+            *_protection_lines(database, exchange, after),
+            "",
+            outcome,
+        ]
+    )
+    return ExitCode.SUCCESS
+
+
+def _protection_status(args: argparse.Namespace, context: _Context) -> ExitCode:
+    """Report protection and configuration compatibility; opens the file read-only.
+
+    No manifest entry or fingerprint is printed. Exit 3 when the marker is
+    invalid, or with --require-protected when the file is unprotected or this
+    process's finality configuration could not write to it.
+    """
+    database = _database(args)
+    exchange = _protection_exchange(args)
+    state = inspect_protection(database, exchange)
+    lines = ["REVIEWED-CANDLE PROTECTION", *_protection_lines(database, exchange, state)]
+    compatible, configuration = _protection_configuration(context, state, exchange)
+    lines.append(f"Configuration: {configuration}")
+    failures: list[str] = []
+    if not state.valid:
+        failures.append("the protection marker is invalid")
+    if args.require_protected:
+        if not state.protected:
+            failures.append("the database is not reviewed-candle protected")
+        if not compatible:
+            failures.append("this configuration cannot write to the protected database")
+    lines += ["", "STATUS: SAFE" if not failures else "STATUS: UNSAFE -- " + "; ".join(failures)]
+    context.write(lines)
+    return ExitCode.SUCCESS if not failures else ExitCode.CONFIGURATION
+
+
+def _protection_configuration(context: _Context, state, exchange: ExchangeCode) -> tuple[bool, str]:
+    """Whether this process's finality configuration could write; never prints a manifest."""
+    try:
+        settings = load_session_operation_settings(context.env)
+    except DashboardSettingsError as error:
+        return False, f"INVALID -- {error}"
+    mode = settings.finality_mode
+    if mode is FuturesDailyBarFinalityMode.OPERATOR_REVIEWED:
+        product_text = context.env.get("NORTHSTAR_FUTURES_PRODUCT", "").strip()
+        if not product_text:
+            return False, f"{mode.value}, but NORTHSTAR_FUTURES_PRODUCT is not set"
+        try:
+            product = FuturesProductReference(Symbol(product_text), exchange)
+            approvals = load_candle_approvals(settings, product)
+        except (DashboardSettingsError, ValueError) as error:
+            return False, f"{mode.value}, INVALID manifest -- {type(error).__name__}"
+        return True, (
+            f"{mode.value} (final through {settings.final_through}); manifest valid, "
+            f"{len(approvals.approvals)} approved candle version(s)"
+        )
+    if mode is FuturesDailyBarFinalityMode.OPERATOR_APPROVED:
+        return True, (
+            f"{mode.value} (final through {settings.final_through}): may wait or replay; "
+            "acquires and decides no new NSE session"
+        )
+    if state.protected:
+        return False, f"{mode.value}: REFUSED by a protected database"
+    return True, f"{mode.value}: legacy behaviour on an unprotected database"
 
 
 # ---------------------------------------------------------------------------
@@ -2042,6 +2315,54 @@ def build_parser() -> argparse.ArgumentParser:
     report_parser.add_argument("--expiration", help="only this contract expiration, YYYY-MM-DD")
     report_parser.add_argument("--trading-date", help="only this trading date, YYYY-MM-DD")
     report_parser.set_defaults(handler=_finality_evidence_report)
+    identity_parser = evidence_commands.add_parser(
+        "identity",
+        help=(
+            "print the fdc1 fingerprint of one evidence record, for an approval manifest "
+            "entry; offline, prints no candle value and approves nothing"
+        ),
+    )
+    identity_parser.add_argument(
+        "--evidence", required=True, help="JSON Lines evidence file written by 'observe'"
+    )
+    _add_contract(identity_parser)
+    identity_parser.add_argument(
+        "--trading-date", required=True, help="the reviewed NSE session, YYYY-MM-DD"
+    )
+    identity_parser.add_argument(
+        "--line",
+        type=int,
+        help="the exact evidence line reviewed; required when several records match",
+    )
+    identity_parser.set_defaults(handler=_finality_evidence_identity)
+
+    protection = groups.add_parser(
+        "protection",
+        help="reviewed-candle protection marker of a database (FG-9 OD-9)",
+    )
+    protection_commands = protection.add_subparsers(dest="command", required=True)
+    init_parser = protection_commands.add_parser(
+        "init",
+        help=(
+            "mark an existing database reviewed-candle protected; idempotent; run only "
+            "while no other writer can run"
+        ),
+    )
+    _add_database(init_parser)
+    init_parser.add_argument("--exchange", required=True, help="exchange code: NSE")
+    init_parser.set_defaults(handler=_protection_init)
+    status_parser = protection_commands.add_parser(
+        "status",
+        help="read-only: report the marker and this configuration's compatibility",
+    )
+    _add_database(status_parser)
+    status_parser.add_argument("--exchange", required=True, help="exchange code: NSE")
+    status_parser.add_argument(
+        "--require-protected",
+        action="store_true",
+        help="exit 3 unless protected and writable by this configuration (preflight)",
+    )
+    status_parser.set_defaults(handler=_protection_status)
     return parser
 
 
