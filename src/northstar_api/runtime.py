@@ -100,6 +100,7 @@ from northstar_application.application_services import (
     FuturesDailyAcquisitionResult,
     FuturesExpiryFlattenGuard,
     FuturesExpiryFlattenPolicy,
+    FuturesReviewedCandleVerification,
     GetFuturesPaperTradingSnapshotUseCase,
     GetOptionContractEconomicsUseCase,
     OperatorApprovedFuturesDailyBarFinalityPolicy,
@@ -156,7 +157,7 @@ from northstar_infrastructure.persistence import (
     initialize_option_contract_economics_schema,
 )
 
-from northstar_api.settings import FuturesDailyBarFinalityMode, FuturesSessionOperationSettings
+from northstar_api.settings import FuturesSessionOperationSettings
 
 # The accepted Indian MVP policy: flat by the OPEN of the session five trading
 # sessions before expiry, so the flatten is decided at the E-6 close.
@@ -478,6 +479,7 @@ def build_upstox_market_sync_runtime(
     *,
     fetch: UpstoxFetch | None = None,
     current_instant: datetime | None = None,
+    reviewed_candles: FuturesReviewedCandleVerification | None = None,
 ) -> AcquireFuturesNativeDailyHistoryUseCase:
     """Initialize the database and wire Upstox native daily acquisition into it.
 
@@ -490,6 +492,10 @@ def build_upstox_market_sync_runtime(
     the adapter serves that instant's venue date from Upstox's current-day
     endpoint; without it -- manual ``market-data sync`` -- every date is
     historical. It routes endpoints only and decides no eligibility.
+
+    ``reviewed_candles`` makes the use case accept only operator-approved
+    candle versions; it is passed whenever the finality mode is
+    operator-reviewed, and the use case refuses anything else before storing.
 
     ``fetch`` replaces the adapter's HTTP transport, for tests only.
     """
@@ -505,6 +511,7 @@ def build_upstox_market_sync_runtime(
         NSEFuturesTradingSessionResolver(),
         source,
         SQLiteFuturesHistoricalMarketDataStore(path),
+        reviewed_candles=reviewed_candles,
     )
 
 
@@ -531,7 +538,9 @@ def build_daily_bar_finality_policy(
 
     Only the two deterministic Application policies exist. Neither reads a
     clock, and there is deliberately no automatic, time-based composition.
+    Both operated modes share the final-through date policy; what
+    operator-reviewed adds is enforced where candles are acquired and decided.
     """
-    if settings.finality_mode is FuturesDailyBarFinalityMode.OPERATOR_APPROVED:
+    if settings.finality_mode.uses_final_through:
         return OperatorApprovedFuturesDailyBarFinalityPolicy(settings.final_through)
     return DisabledFuturesDailyBarFinalityPolicy()

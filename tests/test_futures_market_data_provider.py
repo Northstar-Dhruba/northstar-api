@@ -64,6 +64,7 @@ from northstar_api.runtime import (
 )
 from northstar_api.settings import (
     MARKET_DATA_PROVIDER_VARIABLE,
+    SESSION_OPERATION_VARIABLES,
     DashboardSettingsError,
     FuturesMarketDataProvider,
     load_market_data_provider,
@@ -370,8 +371,12 @@ def test_the_composition_root_reads_no_clock_for_upstox() -> None:
             for cutoff in ("16:00", "19:00", "21:00", "previous day", "next morning"):
                 assert cutoff not in node.value
     assert [a.arg for a in builder.args.args] == ["path", "access_token"]
-    assert [a.arg for a in builder.args.kwonlyargs] == ["fetch", "current_instant"]
-    assert [ast.unparse(d) for d in builder.args.kw_defaults] == ["None", "None"]
+    assert [a.arg for a in builder.args.kwonlyargs] == [
+        "fetch",
+        "current_instant",
+        "reviewed_candles",
+    ]
+    assert [ast.unparse(d) for d in builder.args.kw_defaults] == ["None", "None", "None"]
 
 
 def test_manual_upstox_sync_supplies_no_current_instant(database: Path) -> None:
@@ -439,7 +444,11 @@ def test_upstox_selection_builds_the_upstox_path_with_only_its_token(database: P
     assert outcome.code == ExitCode.SUCCESS
     assert runtimes.upstox == [(database, _UPSTOX_TOKEN)]
     assert runtimes.databento == []
-    assert env.read == ["UPSTOX_ANALYTICS_TOKEN"]
+    # Besides its token, an NSE sync reads only the finality settings (FG-9), never
+    # another provider's secret.
+    assert [name for name in env.read if name not in SESSION_OPERATION_VARIABLES] == [
+        "UPSTOX_ANALYTICS_TOKEN"
+    ]
     assert "Provider: upstox" in outcome.out
     _assert_no_secret(outcome)
 
@@ -721,12 +730,20 @@ def test_operations_daily_rejects_an_unsupported_provider(database: Path) -> Non
 
 @pytest.mark.parametrize("provider", [None, "databento"])
 def test_operations_daily_keeps_the_databento_path(database: Path, provider: str | None) -> None:
-    """Unset or explicit databento passes selection and reaches the Databento secret check."""
+    """Unset or explicit databento passes selection and reaches the Databento secret check.
+
+    A CME contract: an NSE contract is refused before Databento (FG-9.2D).
+    """
     extra = {} if provider is None else {MARKET_DATA_PROVIDER_VARIABLE: provider}
+    cme = {
+        "NORTHSTAR_FUTURES_PRODUCT": "ES",
+        "NORTHSTAR_FUTURES_EXCHANGE": "CME",
+        "NORTHSTAR_FUTURES_EXPIRATION": "2026-12-18",
+    }
 
     outcome = _cli(
         ["operations", "daily"],
-        env=_operation_env(database, **extra),
+        env=_operation_env(database, **cme, **extra),
         clock=_never_called_clock,
     )
 

@@ -14,11 +14,17 @@ NORTHSTAR_FUTURES_MARKET_DATA_PROVIDER names the futures market-data provider
 the daily operation acquires from. It is read on its own, only by the daily
 operation, and is never inferred from which credential happens to be present.
 
-Three more settings drive the chronological (Upstox / NSE) daily operation only:
+Four more settings drive the chronological (Upstox / NSE) daily operation only:
 
-    NORTHSTAR_FUTURES_DAILY_BAR_FINALITY   disabled (default) | operator-approved
+    NORTHSTAR_FUTURES_DAILY_BAR_FINALITY   disabled (default) | operator-approved |
+                                           operator-reviewed
     NORTHSTAR_FUTURES_FINAL_THROUGH        last trading date the operator approved
-                                           as final; required when operator-approved
+                                           as final; required unless disabled
+    NORTHSTAR_FUTURES_APPROVED_CANDLES     the approved candle versions (the fdc1
+                                           manifest); required, possibly empty, when
+                                           operator-reviewed. It is read exactly as
+                                           given: whitespace is never trimmed away,
+                                           so the strict parser sees it
     NORTHSTAR_FUTURES_GO_LIVE              the first trading session the operated
                                            portfolio decides on, used only while
                                            no decision has been frozen yet
@@ -35,6 +41,11 @@ from datetime import date
 from enum import StrEnum
 from pathlib import Path
 
+from northstar_application.application_services import (
+    FuturesCandleApprovalSet,
+    InvalidFuturesCandleApprovalSetError,
+    parse_futures_candle_approval_manifest,
+)
 from northstar_core.derivatives import ExpirationDate
 from northstar_core.foundation.value_objects import ExchangeCode, Symbol
 from northstar_core.futures import FuturesContract, FuturesProductReference
@@ -59,10 +70,12 @@ MARKET_DATA_PROVIDER_VARIABLE = "NORTHSTAR_FUTURES_MARKET_DATA_PROVIDER"
 DAILY_BAR_FINALITY_VARIABLE = "NORTHSTAR_FUTURES_DAILY_BAR_FINALITY"
 FINAL_THROUGH_VARIABLE = "NORTHSTAR_FUTURES_FINAL_THROUGH"
 GO_LIVE_VARIABLE = "NORTHSTAR_FUTURES_GO_LIVE"
+APPROVED_CANDLES_VARIABLE = "NORTHSTAR_FUTURES_APPROVED_CANDLES"
 SESSION_OPERATION_VARIABLES = (
     DAILY_BAR_FINALITY_VARIABLE,
     FINAL_THROUGH_VARIABLE,
     GO_LIVE_VARIABLE,
+    APPROVED_CANDLES_VARIABLE,
 )
 _TRADING_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _ORIGIN = re.compile(r"https?://[^/\s]+")
@@ -107,18 +120,30 @@ class FuturesDailyBarFinalityMode(StrEnum):
 
     DISABLED never establishes it, so nothing is acquired or decided.
     OPERATOR_APPROVED treats sessions through an explicit final-through trading
-    date as final. There is deliberately no automatic, time-based mode.
+    date as final. For an NSE contract it no longer authorizes acquiring or
+    deciding any new session: a date alone never approves provider values.
+    OPERATOR_REVIEWED uses the same final-through date and additionally
+    requires every acquired or decided candle to be the exact version approved
+    in the candle manifest. There is deliberately no automatic, time-based mode.
     """
 
     DISABLED = "disabled"
     OPERATOR_APPROVED = "operator-approved"
+    OPERATOR_REVIEWED = "operator-reviewed"
+
+    @property
+    def uses_final_through(self) -> bool:
+        return self is not FuturesDailyBarFinalityMode.DISABLED
 
 
 @dataclass(frozen=True, slots=True)
 class FuturesSessionOperationSettings:
     """Validated settings of the chronological daily operation.
 
-    ``final_through`` is present exactly when the mode is OPERATOR_APPROVED.
+    ``final_through`` is present exactly when the mode is not DISABLED.
+    ``approved_candles`` is the raw manifest text, present exactly when the
+    mode is OPERATOR_REVIEWED; it is parsed against the operated product by
+    ``load_candle_approvals``.
     ``go_live`` is optional here; whether it is required depends on persisted
     state, which only the operation itself can read.
     """
@@ -126,6 +151,8 @@ class FuturesSessionOperationSettings:
     finality_mode: FuturesDailyBarFinalityMode
     final_through: date | None
     go_live: date | None
+    # The manifest text exactly as configured; present only when operator-reviewed.
+    approved_candles: str | None = None
 
 
 def _trading_date(text: str) -> date:
@@ -143,10 +170,12 @@ def _finality_mode(text: str) -> FuturesDailyBarFinalityMode:
 
 
 def load_session_operation_settings(env: Mapping[str, str]) -> FuturesSessionOperationSettings:
-    """Return the chronological operation's finality and go-live settings.
+    """Return the chronological operation's finality, go-live and approval settings.
 
-    An unset finality mode is DISABLED. OPERATOR_APPROVED without a valid
-    final-through date is an error, never a silent fall-back to DISABLED.
+    An unset finality mode is DISABLED. OPERATOR_APPROVED or OPERATOR_REVIEWED
+    without a valid final-through date is an error, and OPERATOR_REVIEWED without
+    the approved-candles variable is an error: never a silent fall-back to a
+    weaker mode. The manifest is kept exactly as given, never trimmed.
     """
     mode_text = env.get(DAILY_BAR_FINALITY_VARIABLE, "").strip()
     mode = (
@@ -155,7 +184,7 @@ def load_session_operation_settings(env: Mapping[str, str]) -> FuturesSessionOpe
         else FuturesDailyBarFinalityMode.DISABLED
     )
     final_through: date | None = None
-    if mode is FuturesDailyBarFinalityMode.OPERATOR_APPROVED:
+    if mode.uses_final_through:
         text = env.get(FINAL_THROUGH_VARIABLE, "").strip()
         if not text:
             raise DashboardSettingsError(
@@ -163,9 +192,37 @@ def load_session_operation_settings(env: Mapping[str, str]) -> FuturesSessionOpe
                 f"{mode.value}."
             )
         final_through = _value(FINAL_THROUGH_VARIABLE, text, _trading_date)
+    approved_candles: str | None = None
+    if mode is FuturesDailyBarFinalityMode.OPERATOR_REVIEWED:
+        approved_candles = env.get(APPROVED_CANDLES_VARIABLE)
+        if approved_candles is None:
+            raise DashboardSettingsError(
+                f"{APPROVED_CANDLES_VARIABLE} is required when {DAILY_BAR_FINALITY_VARIABLE}="
+                f"{mode.value}; set it, empty when no candle is approved yet."
+            )
     go_live_text = env.get(GO_LIVE_VARIABLE, "").strip()
     go_live = _value(GO_LIVE_VARIABLE, go_live_text, _trading_date) if go_live_text else None
-    return FuturesSessionOperationSettings(mode, final_through, go_live)
+    return FuturesSessionOperationSettings(mode, final_through, go_live, approved_candles)
+
+
+def load_candle_approvals(
+    settings: FuturesSessionOperationSettings, product: FuturesProductReference
+) -> FuturesCandleApprovalSet:
+    """Parse the configured manifest for the operated product; reviewed mode only.
+
+    A malformed manifest is a configuration error. An empty one is a valid set
+    that approves nothing.
+    """
+    if settings.finality_mode is not FuturesDailyBarFinalityMode.OPERATOR_REVIEWED:
+        raise DashboardSettingsError(
+            f"Candle approvals exist only when {DAILY_BAR_FINALITY_VARIABLE}=operator-reviewed."
+        )
+    if settings.approved_candles is None:
+        raise DashboardSettingsError(f"{APPROVED_CANDLES_VARIABLE} is required.")
+    try:
+        return parse_futures_candle_approval_manifest(settings.approved_candles, product)
+    except InvalidFuturesCandleApprovalSetError as exc:
+        raise DashboardSettingsError(f"{APPROVED_CANDLES_VARIABLE} is invalid: {exc}") from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,6 +324,9 @@ def load_dashboard_settings(env: Mapping[str, str]) -> DashboardSettings | None:
     if values is None:
         return None
     operation = _operation(values)
+    operations = load_session_operation_settings(env)
+    if operations.finality_mode is FuturesDailyBarFinalityMode.OPERATOR_REVIEWED:
+        load_candle_approvals(operations, operation.contract.product)  # refuse a malformed one
     return DashboardSettings(
         database=operation.database,
         web_origin=_value("NORTHSTAR_WEB_ORIGIN", values["NORTHSTAR_WEB_ORIGIN"], _origin),
@@ -274,5 +334,5 @@ def load_dashboard_settings(env: Mapping[str, str]) -> DashboardSettings | None:
         strategy=operation.strategy,
         portfolio=operation.portfolio,
         target=operation.target,
-        operations=load_session_operation_settings(env),
+        operations=operations,
     )

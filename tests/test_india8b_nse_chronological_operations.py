@@ -29,15 +29,23 @@ from pathlib import Path
 from urllib.error import HTTPError
 
 import pytest
-from northstar_application.application_services import FuturesPaperExecutionIdentityService
+from northstar_application.application_services import (
+    FuturesPaperExecutionIdentityService,
+    futures_daily_candle_fingerprint,
+)
 from northstar_application.ports import FuturesSessionResolutionError
+from northstar_core.derivatives import ExpirationDate, QuoteValue
+from northstar_core.foundation.value_objects import Quantity, Timeframe
+from northstar_core.futures import FuturesContract, FuturesOHLCVBar
 from northstar_infrastructure.market_data import (
     NSEFuturesTradingSessionResolver,
     upstox_http,
 )
 from northstar_infrastructure.persistence import FuturesPaperTradingStorageError
 from test_india7_nifty_incremental_operations_acceptance import (
+    _CONTRACT,
     _E8_BAR,
+    _LOT,
     _PORTFOLIO,
     _SESSIONS,
     _STRATEGY,
@@ -55,6 +63,7 @@ from northstar_api import cli as cli_module
 from northstar_api.cli import ExitCode, main
 from northstar_api.operations_lock import DatabaseOperationsLock
 from northstar_api.runtime import build_upstox_market_sync_runtime
+from northstar_api.settings import APPROVED_CANDLES_VARIABLE
 
 # ---------------------------------------------------------------------------
 # No network for the whole module
@@ -86,6 +95,31 @@ def _never_read_the_clock():
     raise AssertionError("the chronological operation must not read the clock")
 
 
+def _served_approvals(op: Operator, expiration: str = "2026-10-27") -> str:
+    """The fdc1 manifest approving every candle the double currently serves.
+
+    Built from the double's own rows, not through it, so no request is recorded.
+    """
+    contract = FuturesContract(_CONTRACT.product, ExpirationDate(expiration))
+    entries = []
+    served = _SESSIONS[: len(op.upstox.market.closes)]  # the bars the market defines
+    for bar, session in enumerate(served, start=1):
+        _label, open_, high, low, close, volume, _oi = op.upstox._row(bar)
+        candle = FuturesOHLCVBar(
+            contract=contract,
+            point_in_time=session.closes_at,
+            timeframe=Timeframe("1d"),
+            open=QuoteValue(Decimal(open_)),
+            high=QuoteValue(Decimal(high)),
+            low=QuoteValue(Decimal(low)),
+            close=QuoteValue(Decimal(close)),
+            volume=Quantity(Decimal(volume // _LOT)),
+        )
+        fingerprint = futures_daily_candle_fingerprint(contract, session.trading_date, candle)
+        entries.append(f"{expiration}/{session.trading_date.isoformat()}={fingerprint}")
+    return ",".join(entries)
+
+
 def _date(value: int | str | date) -> str:
     if isinstance(value, int):
         return _day(value)
@@ -95,13 +129,14 @@ def _date(value: int | str | date) -> str:
 def _env(
     op: Operator,
     *,
-    finality: str | None = "operator-approved",
+    finality: str | None = "operator-reviewed",
     final_through: int | str | None = None,
     go_live: int | str | None = None,
     expiration: str = "2026-10-27",
     exchange: str = "NSE",
     token: str | None = _TOKEN,
     provider: str = "upstox",
+    approvals: str | None = None,
 ) -> dict[str, str]:
     env = {
         "NORTHSTAR_DATABASE": str(op.database),
@@ -117,6 +152,12 @@ def _env(
         env["UPSTOX_ANALYTICS_TOKEN"] = token
     if finality is not None:
         env["NORTHSTAR_FUTURES_DAILY_BAR_FINALITY"] = finality
+    if finality == "operator-reviewed":
+        # By default the operator has reviewed and approved exactly what the
+        # synthetic provider serves right now (FG-9); a test may pass its own.
+        env[APPROVED_CANDLES_VARIABLE] = (
+            _served_approvals(op, expiration) if approvals is None else approvals
+        )
     if final_through is not None:
         env["NORTHSTAR_FUTURES_FINAL_THROUGH"] = _date(final_through)
     if go_live is not None:
@@ -157,9 +198,40 @@ def _daily(op: Operator, fetch=None, *, clock=None, **settings) -> Outcome:
         stdout=out,
         stderr=err,
         clock=clock or _Clock(_EXPIRY_MORNING),
-        upstox_market_sync_runtime=lambda path, token, current_instant=None: (
+        upstox_market_sync_runtime=lambda path, token, current_instant=None, **kw: (
             build_upstox_market_sync_runtime(
-                path, token, fetch=fetch or op.upstox, current_instant=current_instant
+                path, token, fetch=fetch or op.upstox, current_instant=current_instant, **kw
+            )
+        ),
+    )
+    return Outcome(code, out.getvalue(), err.getvalue())
+
+
+def _sync_args(op: Operator, bar: int) -> list[str]:
+    return ["market-data", "sync", "--database", str(op.database), "--product", "NIFTY",
+            "--exchange", "NSE", "--expiration", "2026-10-27", "--start", _day(bar),
+            "--end", _day(bar), "--provider", "upstox"]  # fmt: skip
+
+
+def _paper_args(op: Operator, bar: int) -> list[str]:
+    return ["paper", "run", "--database", str(op.database), "--product", "NIFTY",
+            "--exchange", "NSE", "--expiration", "2026-10-27",
+            "--strategy", _STRATEGY.identity, "--portfolio", _PORTFOLIO.identity,
+            "--target", "1", "--as-of", _close(bar)]  # fmt: skip
+
+
+def _manual(op: Operator, argv: list[str], **settings) -> Outcome:
+    """A manual command run with the operated environment, as FG-9 requires."""
+    out, err = io.StringIO(), io.StringIO()
+    code = main(
+        argv,
+        env=_env(op, go_live=21, **settings),
+        stdout=out,
+        stderr=err,
+        clock=_never_read_the_clock,
+        upstox_market_sync_runtime=lambda path, token, current_instant=None, **kw: (
+            build_upstox_market_sync_runtime(
+                path, token, fetch=op.upstox, current_instant=current_instant, **kw
             )
         ),
     )
@@ -232,7 +304,7 @@ def test_one_approved_session_is_acquired_and_paper_run(tmp_path: Path) -> None:
     assert run.code == ExitCode.SUCCESS, run.err
     assert _requests_after(op, requests) == [(_day(21), _day(21))]
     assert _decisions(op) == [_close(21)]
-    assert f"Finality mode: operator-approved (final through {_day(21)})" in run.out
+    assert f"Finality mode: operator-reviewed (final through {_day(21)})" in run.out
     assert f"Go-live session: {_day(21)} (no decision frozen yet)" in run.out
     assert f"  {_day(21)} FINAL: Session {_day(21)} is on or before" in run.out
     assert f"Acquired: {_day(21)} .. {_day(21)} (1 sessions)" in run.out
@@ -321,14 +393,21 @@ def test_an_interrupted_frozen_decision_is_completed_without_duplication(
 ) -> None:
     op = _operator(tmp_path, "interrupted")
     assert _daily(op, final_through=21, go_live=21).code == ExitCode.SUCCESS
-    assert op.sync(22).code == ExitCode.SUCCESS
+    # The file is now reviewed-candle protected, so the manual commands run reviewed too.
+    assert _manual(op, _sync_args(op, 22), final_through=22).code == ExitCode.SUCCESS
+
+    real = NSEFuturesTradingSessionResolver.sessions_in_range
+    calls = []
 
     def fail_closed(self, product, start_date, end_date):
+        calls.append(start_date)
+        if len(calls) == 1:  # the paper guard's own planning still succeeds
+            return real(self, product, start_date, end_date)
         raise FuturesSessionResolutionError("calendar unavailable (fail closed)")
 
     with monkeypatch.context() as patch:  # bar 22's decision freezes, its execution fails
         patch.setattr(NSEFuturesTradingSessionResolver, "sessions_in_range", fail_closed)
-        assert op.paper(22).code == ExitCode.PROVIDER
+        assert _manual(op, _paper_args(op, 22), final_through=22).code == ExitCode.PROVIDER
     assert _decisions(op) == [_close(21), _close(22)] and op.facts()["orders"] == ()
 
     run = _daily(op, final_through=23)
@@ -367,10 +446,10 @@ def test_a_paper_failure_stops_before_any_later_session(
     op = _operator(tmp_path, "stop")
     real = cli_module._run_paper_session
 
-    def failing(context, runtime, contract, strategy, portfolio, target, as_of):
+    def failing(context, runtime, database, contract, strategy, portfolio, target, as_of):
         if as_of.value == _close(22):
             raise FuturesSessionResolutionError("calendar unavailable at session 22")
-        return real(context, runtime, contract, strategy, portfolio, target, as_of)
+        return real(context, runtime, database, contract, strategy, portfolio, target, as_of)
 
     with monkeypatch.context() as patch:
         patch.setattr(cli_module, "_run_paper_session", failing)

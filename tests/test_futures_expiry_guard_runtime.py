@@ -61,7 +61,10 @@ from northstar_api.runtime import (
     DatabaseRuntime,
     build_database_runtime,
 )
-from northstar_api.settings import MARKET_DATA_PROVIDER_VARIABLE
+from northstar_api.settings import (
+    MARKET_DATA_PROVIDER_VARIABLE,
+    SESSION_OPERATION_VARIABLES,
+)
 
 _NSE = ExchangeCode("NSE")
 _NIFTY = FuturesProductReference(Symbol("NIFTY"), _NSE)
@@ -334,7 +337,12 @@ def test_paper_run_routes_by_contract_exchange_whatever_the_provider(
     )
 
     assert calls == [(expected, contract)]
-    assert tracking.read == []
+    # Routing never reads the provider or a credential. An NSE paper run reads
+    # only the finality settings its reviewed-candle guard needs (FG-9).
+    if expected == "guarded":
+        assert set(tracking.read) <= set(SESSION_OPERATION_VARIABLES)
+    else:
+        assert tracking.read == []
 
 
 def test_no_k_option_exists_on_paper_commands(tmp_path: Path) -> None:
