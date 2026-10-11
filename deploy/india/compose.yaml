@@ -30,6 +30,10 @@ x-futures-settings: &futures-settings
   NORTHSTAR_FUTURES_DAILY_BAR_FINALITY: ${NORTHSTAR_FUTURES_DAILY_BAR_FINALITY:-disabled}
   NORTHSTAR_FUTURES_FINAL_THROUGH: ${NORTHSTAR_FUTURES_FINAL_THROUGH:-}
   NORTHSTAR_FUTURES_GO_LIVE: ${NORTHSTAR_FUTURES_GO_LIVE:-}
+  # The fdc1 approval manifest, passed through exactly as .env holds it. Unset
+  # becomes empty, which approves nothing: operator-reviewed then refuses every
+  # session (exit 8). Read only in operator-reviewed mode.
+  NORTHSTAR_FUTURES_APPROVED_CANDLES: ${NORTHSTAR_FUTURES_APPROVED_CANDLES:-}
 
 services:
   india-api:

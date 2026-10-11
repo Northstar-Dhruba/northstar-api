@@ -432,6 +432,9 @@ def test_a_completed_run_is_logged_recorded_and_passes_exit_zero(harness: Harnes
         (5, "", "FAILED"),
         (6, "", "FAILED"),
         (7, "STATUS: EXPIRY EXCEPTION\n", "EXPIRY_EXCEPTION"),
+        (8, "", "FAILED"),
+        (8, "STATUS: WAITING -- printed before the refusal\n", "FAILED"),
+        (3, "", "FAILED"),
     ],
     ids=[
         "waiting",
@@ -443,6 +446,9 @@ def test_a_completed_run_is_logged_recorded_and_passes_exit_zero(harness: Harnes
         "state",
         "provider",
         "expiry-exception",
+        "candle-approval",
+        "candle-approval-never-waiting",
+        "configuration",
     ],
 )
 def test_northstar_exit_codes_pass_through_and_outcomes_are_classified(
@@ -451,6 +457,9 @@ def test_northstar_exit_codes_pass_through_and_outcomes_are_classified(
     stderr = {
         5: "STATE ERROR: conflict\n",
         7: "EXPIRY_EXCEPTION ERROR: Expiry exception: NIFTY@NSE 2026-10-27\n",
+        8: "CANDLE_APPROVAL ERROR: FuturesCandleApprovalMissingError: No approved candle "
+        "version for NIFTY@NSE 2026-10-27 sessions: 2026-10-09.\n",
+        3: "CONFIGURATION ERROR: This database requires reviewed candles for NSE futures\n",
     }.get(exit_code, "")
     harness.scenario(stdout=stdout, stderr=stderr, exit_code=exit_code)
 
@@ -466,6 +475,14 @@ def test_northstar_exit_codes_pass_through_and_outcomes_are_classified(
     if exit_code == 7:
         assert status["exitClass"] == "EXPIRY_EXCEPTION"
         assert status["reason"].startswith("EXPIRY_EXCEPTION ERROR: Expiry exception:")
+    if exit_code == 8:
+        assert status["exitClass"] == "CANDLE_APPROVAL"
+        assert status["reason"].startswith(
+            "CANDLE_APPROVAL ERROR: FuturesCandleApprovalMissingError: No approved candle"
+        )
+    if exit_code == 3:
+        assert status["exitClass"] == "CONFIGURATION"
+        assert status["reason"].startswith("CONFIGURATION ERROR: This database requires")
 
 
 @_windows

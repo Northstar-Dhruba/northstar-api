@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from northstar_api.settings import (
+    APPROVED_CANDLES_VARIABLE,
     DAILY_BAR_FINALITY_VARIABLE,
     FINAL_THROUGH_VARIABLE,
     GO_LIVE_VARIABLE,
@@ -36,7 +37,12 @@ _INDIA = _DEPLOY / "india"
 _RUNBOOK = _API.parent / "northstar-docs" / "operations" / "Indian-Futures-Deployment-Runbook.md"
 _TOKEN = "UPSTOX_ANALYTICS_TOKEN"
 _CME_VOLUME = "northstar_northstar-data"
-_SESSION_VARIABLES = (DAILY_BAR_FINALITY_VARIABLE, FINAL_THROUGH_VARIABLE, GO_LIVE_VARIABLE)
+_SESSION_VARIABLES = (
+    DAILY_BAR_FINALITY_VARIABLE,
+    FINAL_THROUGH_VARIABLE,
+    GO_LIVE_VARIABLE,
+    APPROVED_CANDLES_VARIABLE,
+)
 _DESTRUCTIVE = (
     re.compile(r"\bdown\b[^\n]*(\s-v\b|\s--volumes\b)"),
     re.compile(r"\bvolume\s+rm\b"),
@@ -180,6 +186,10 @@ def test_the_api_gets_observability_settings_but_never_the_token(india: str) -> 
     for name in (*OPERATION_VARIABLES, *_SESSION_VARIABLES):
         assert re.search(rf"^  {name}: ", anchor, re.MULTILINE), name
     assert f"{DAILY_BAR_FINALITY_VARIABLE}: ${{{DAILY_BAR_FINALITY_VARIABLE}:-disabled}}" in anchor
+    # The manifest passes through verbatim; unset becomes empty, which approves nothing.
+    assert f"  {APPROVED_CANDLES_VARIABLE}: ${{{APPROVED_CANDLES_VARIABLE}:-}}" in anchor.split(
+        "\n"
+    )
     api = _services(india)["india-api"]
     assert "<<: *futures-settings" in api
     assert "NORTHSTAR_WEB_ORIGIN" in api
@@ -260,6 +270,7 @@ def test_no_finality_time_or_automatic_rollover_is_configured(india: str) -> Non
     assert not [key for key in keys if re.search(r"ROLLOVER|DELAY|CUTOFF|HOUR|TIME|_K$", key)]
     assert example[DAILY_BAR_FINALITY_VARIABLE] == "disabled"
     assert example[FINAL_THROUGH_VARIABLE] == "" and example[GO_LIVE_VARIABLE] == ""
+    assert example[APPROVED_CANDLES_VARIABLE] == ""  # never a real fingerprint
     for text in (
         india,
         _read(_INDIA / ".env.example"),
