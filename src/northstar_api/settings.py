@@ -336,3 +336,79 @@ def load_dashboard_settings(env: Mapping[str, str]) -> DashboardSettings | None:
         target=operation.target,
         operations=operations,
     )
+
+
+# ---------------------------------------------------------------------------
+# Private futures recommendation operations (F-5D-2), disabled by default
+# ---------------------------------------------------------------------------
+
+RECOMMENDATIONS_VARIABLE = "NORTHSTAR_FUTURES_RECOMMENDATIONS"
+RECOMMENDATION_PROFILE_VARIABLE = "NORTHSTAR_FUTURES_RECOMMENDATION_PROFILE"
+CONTRACT_LAST_SESSION_VARIABLE = "NORTHSTAR_FUTURES_CONTRACT_LAST_SESSION"
+CONTRACT_CUTOFF_AUTHORITY_VARIABLE = "NORTHSTAR_FUTURES_CONTRACT_CUTOFF_AUTHORITY"
+
+
+class FuturesRecommendationOperationsMode(StrEnum):
+    """Whether the daily operation monitors and generates private recommendations."""
+
+    DISABLED = "disabled"
+    ENABLED = "enabled"
+
+
+@dataclass(frozen=True, slots=True)
+class FuturesRecommendationSettings:
+    """Validated settings of the private recommendation cycle.
+
+    ``mode`` is DISABLED unless the variable says ``enabled``; disabled reads
+    nothing else. When enabled, ``profile_version`` names the approved
+    generation configuration to run, and ``last_session`` with
+    ``cutoff_authority`` -- both or neither -- is the operator's statement of
+    the configured contract's last tradable session. Enabled is necessary,
+    never sufficient: every other gate still applies.
+    """
+
+    mode: FuturesRecommendationOperationsMode
+    profile_version: str | None = None
+    last_session: date | None = None
+    cutoff_authority: str | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return self.mode is FuturesRecommendationOperationsMode.ENABLED
+
+
+def _recommendation_mode(text: str) -> FuturesRecommendationOperationsMode:
+    try:
+        return FuturesRecommendationOperationsMode(text.strip().lower())
+    except ValueError:
+        supported = ", ".join(mode.value for mode in FuturesRecommendationOperationsMode)
+        raise ValueError(f"must be one of {supported}; got {text!r}") from None
+
+
+def load_recommendation_settings(env: Mapping[str, str]) -> FuturesRecommendationSettings:
+    """Return the recommendation settings; unset is DISABLED, an unknown value is an error."""
+    text = env.get(RECOMMENDATIONS_VARIABLE, "").strip()
+    mode = (
+        _value(RECOMMENDATIONS_VARIABLE, text, _recommendation_mode)
+        if text
+        else FuturesRecommendationOperationsMode.DISABLED
+    )
+    if mode is FuturesRecommendationOperationsMode.DISABLED:
+        return FuturesRecommendationSettings(mode)
+    profile = env.get(RECOMMENDATION_PROFILE_VARIABLE, "").strip()
+    if not profile:
+        raise DashboardSettingsError(
+            f"{RECOMMENDATION_PROFILE_VARIABLE} is required when {RECOMMENDATIONS_VARIABLE}="
+            f"{mode.value}: name an approved recommendation configuration."
+        )
+    last_text = env.get(CONTRACT_LAST_SESSION_VARIABLE, "").strip()
+    authority = env.get(CONTRACT_CUTOFF_AUTHORITY_VARIABLE, "").strip()
+    if bool(last_text) != bool(authority):
+        raise DashboardSettingsError(
+            f"{CONTRACT_LAST_SESSION_VARIABLE} and {CONTRACT_CUTOFF_AUTHORITY_VARIABLE} must be "
+            "set together: a last session needs the reference it was taken from."
+        )
+    last_session = (
+        _value(CONTRACT_LAST_SESSION_VARIABLE, last_text, _trading_date) if last_text else None
+    )
+    return FuturesRecommendationSettings(mode, profile, last_session, authority or None)

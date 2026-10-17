@@ -75,6 +75,18 @@ option session resolver and two read-only SQLite repositories -- the contracts
 the stored Upstox listings made known by an instant, and one expiration's daily
 bars at one exact instant -- into BuildOptionChainSnapshotUseCase. Building it
 checks the path and creates nothing: no file, no table, no lock.
+
+Private futures recommendations
+-------------------------------
+build_futures_recommendation_runtime wires the recommendation definition
+store, repository, generation-audit store and repository and lifecycle store
+onto the same SQLite file as the operated market data and frozen research --
+the one ``NORTHSTAR_DATABASE`` -- because lifecycle steps reference candles in
+that file's ``futures_ohlcv`` and every read verifies them there. There is no
+second database setting. Building it creates nothing; the recommendation
+adapters create their own tables on first use, which the daily operation
+reaches only with ``NORTHSTAR_FUTURES_RECOMMENDATIONS=enabled``, so a disabled
+deployment's database gains no recommendation table.
 """
 
 from __future__ import annotations
@@ -149,6 +161,11 @@ from northstar_infrastructure.persistence import (
     SQLiteFuturesPaperFillStore,
     SQLiteFuturesPaperOrderRepository,
     SQLiteFuturesPaperOrderStore,
+    SQLiteFuturesRecommendationGenerationAuditRepository,
+    SQLiteFuturesRecommendationGenerationAuditStore,
+    SQLiteFuturesTradeRecommendationLifecycleStore,
+    SQLiteFuturesTradeRecommendationRepository,
+    SQLiteFuturesTradeRecommendationStore,
     SQLiteOptionContractEconomicsRepository,
     SQLiteOptionContractEconomicsStore,
     initialize_futures_contract_economics_schema,
@@ -544,3 +561,31 @@ def build_daily_bar_finality_policy(
     if settings.finality_mode.uses_final_through:
         return OperatorApprovedFuturesDailyBarFinalityPolicy(settings.final_through)
     return DisabledFuturesDailyBarFinalityPolicy()
+
+
+@dataclass(frozen=True, slots=True)
+class FuturesRecommendationRuntime:
+    """The recommendation adapters of one SQLite file, beside its market data and research."""
+
+    database: Path
+    store: SQLiteFuturesTradeRecommendationStore
+    repository: SQLiteFuturesTradeRecommendationRepository
+    lifecycle_store: SQLiteFuturesTradeRecommendationLifecycleStore
+    audit_store: SQLiteFuturesRecommendationGenerationAuditStore
+    audit_repository: SQLiteFuturesRecommendationGenerationAuditRepository
+    market_repository: SQLiteFuturesHistoricalMarketDataRepository
+    research_repository: SQLiteFuturesForwardResearchRecordRepository
+
+
+def build_futures_recommendation_runtime(path: Path) -> FuturesRecommendationRuntime:
+    """Wire every recommendation adapter onto ``path``, the operated database; create nothing."""
+    return FuturesRecommendationRuntime(
+        database=path,
+        store=SQLiteFuturesTradeRecommendationStore(path),
+        repository=SQLiteFuturesTradeRecommendationRepository(path),
+        lifecycle_store=SQLiteFuturesTradeRecommendationLifecycleStore(path),
+        audit_store=SQLiteFuturesRecommendationGenerationAuditStore(path),
+        audit_repository=SQLiteFuturesRecommendationGenerationAuditRepository(path),
+        market_repository=SQLiteFuturesHistoricalMarketDataRepository(path),
+        research_repository=SQLiteFuturesForwardResearchRecordRepository(path),
+    )
