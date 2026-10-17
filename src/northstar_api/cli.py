@@ -124,14 +124,19 @@ from northstar_application.application_services import (
     FuturesDailySessionCoverageError,
     FuturesExpiryWindowError,
     FuturesHistoricalDataContractViolationError,
+    FuturesIncompleteCoverageDeclaration,
     FuturesPaperPortfolioStrategyConflictError,
     FuturesPaperTradingContractViolationError,
     FuturesPaperTradingSessionResult,
+    FuturesRecommendationMonitoringSourceError,
+    FuturesRecommendationMonitoringStopReason,
     FuturesReviewedCandleVerification,
+    FuturesTradeRecommendationSourceError,
     GetOptionContractEconomicsUseCase,
     InvalidFuturesCandleApprovalSetError,
     InvalidFuturesDailyCandleIdentityError,
     InvalidFuturesPaperFillHistoryError,
+    InvalidFuturesRecommendationMonitoringError,
     OptionChainContractViolationError,
     OptionChainListingNotKnownError,
     OptionChainSessionNotFoundError,
@@ -152,7 +157,13 @@ from northstar_application.ports import (
     FuturesHistoricalMarketDataQuery,
     FuturesPaperFillConflictError,
     FuturesPaperOrderConflictError,
+    FuturesRecommendationGenerationAuditConflictError,
     FuturesSessionResolutionError,
+    FuturesTradeRecommendationConfigurationConflictError,
+    FuturesTradeRecommendationConflictError,
+    FuturesTradeRecommendationExclusivityError,
+    FuturesTradeRecommendationLifecycleConflictError,
+    FuturesTradeRecommendationLifecycleEvidenceError,
     FuturesTradingSession,
     OptionContractEconomicsConflictError,
     OptionDailyAcquisitionQuery,
@@ -186,6 +197,7 @@ from northstar_core.options import (
     OptionStrike,
 )
 from northstar_core.paper_trading import FuturesContractCount, PaperPortfolioIdentity
+from northstar_core.recommendations.futures import FuturesTradeRecommendationIdentity
 from northstar_core.strategy import StrategyIdentity
 from northstar_infrastructure.market_data import (
     UPSTOX_PROVIDER,
@@ -215,6 +227,7 @@ from northstar_infrastructure.persistence import (
     FuturesContractEconomicsStorageError,
     FuturesForwardResearchStorageError,
     FuturesPaperTradingStorageError,
+    FuturesTradeRecommendationStorageError,
     OptionContractEconomicsStorageError,
 )
 
@@ -224,6 +237,18 @@ from northstar_api.finality_evidence import (
     build_report,
     parse_observations,
     report_lines,
+)
+from northstar_api.futures_recommendation_operations import (
+    APPROVED_FUTURES_RECOMMENDATION_CONFIGURATIONS,
+    FuturesRecommendationConfiguration,
+    FuturesRecommendationConfigurationError,
+    OperatorConfiguredFuturesContractCutoffSource,
+    cycle_lines,
+    declaration_lines,
+    operator_cutoff_source,
+    run_futures_recommendation_cycle,
+    run_incomplete_coverage_declaration,
+    select_configuration,
 )
 from northstar_api.operations import (
     NO_HISTORY,
@@ -254,10 +279,12 @@ from northstar_api.runtime import (
     DatabaseConfigurationError,
     DatabaseRuntime,
     FuturesDailyAcquisition,
+    FuturesRecommendationRuntime,
     OptionEconomicsRuntime,
     OptionInstrumentRuntime,
     build_daily_bar_finality_policy,
     build_database_runtime,
+    build_futures_recommendation_runtime,
     build_market_sync_runtime,
     build_option_chain_runtime,
     build_option_economics_lookup,
@@ -274,6 +301,8 @@ from northstar_api.settings import (
     GO_LIVE_VARIABLE,
     MARKET_DATA_PROVIDER_VARIABLE,
     OPERATION_VARIABLES,
+    RECOMMENDATION_PROFILE_VARIABLE,
+    RECOMMENDATIONS_VARIABLE,
     DashboardSettingsError,
     FuturesDailyBarFinalityMode,
     FuturesMarketDataProvider,
@@ -282,6 +311,7 @@ from northstar_api.settings import (
     load_candle_approvals,
     load_market_data_provider,
     load_operation_settings,
+    load_recommendation_settings,
     load_session_operation_settings,
 )
 
@@ -325,6 +355,14 @@ class CommandError(Exception):
 
 
 _STATE_ERRORS: tuple[type[Exception], ...] = (
+    # Recommendation storage: corrupt or unaudited evidence, a lost race that could
+    # not be reconciled, a product made busy by another writer. Never a rejection.
+    FuturesTradeRecommendationStorageError,
+    FuturesTradeRecommendationConflictError,
+    FuturesTradeRecommendationExclusivityError,
+    FuturesRecommendationGenerationAuditConflictError,
+    FuturesTradeRecommendationLifecycleConflictError,
+    FuturesTradeRecommendationLifecycleEvidenceError,
     FuturesForwardResearchRecordConflictError,
     FuturesPaperOrderConflictError,
     FuturesPaperFillConflictError,
@@ -424,6 +462,14 @@ class _Context:
     # Read-only: builds the chain query without creating the file or any table.
     option_chain_runtime: Callable[[Path], BuildOptionChainSnapshotUseCase] = (
         build_option_chain_runtime
+    )
+    # Private recommendations: adapters on the operated file, and the approved
+    # configurations -- empty in production, since none is approved (ADR-018).
+    recommendation_runtime: Callable[[Path], FuturesRecommendationRuntime] = (
+        build_futures_recommendation_runtime
+    )
+    recommendation_configurations: Mapping[str, FuturesRecommendationConfiguration] = field(
+        default_factory=lambda: APPROVED_FUTURES_RECOMMENDATION_CONFIGURATIONS
     )
     # Secrets read by this invocation; every output line is scrubbed of them.
     secrets: list[str] = field(default_factory=list)
@@ -1593,6 +1639,112 @@ def _configured(load):
         raise CommandError(ExitCode.CONFIGURATION, str(error)) from error
 
 
+@dataclass(frozen=True, slots=True)
+class _RecommendationPlan:
+    """Everything the private recommendation cycle needs, validated before the lock."""
+
+    configuration: FuturesRecommendationConfiguration
+    cutoffs: OperatorConfiguredFuturesContractCutoffSource
+
+
+def _recommendation_plan(
+    context: _Context,
+    settings: FuturesOperationSettings,
+    provider: FuturesMarketDataProvider,
+) -> _RecommendationPlan | None:
+    """Return the recommendation plan, None when disabled; refuse an unusable configuration.
+
+    Disabled -- the default -- reads nothing else and changes nothing. Enabled is
+    necessary but never sufficient: the operation must be the reviewed NSE
+    chronological one, the named configuration must be approved for the
+    operated strategy, and any configured cutoff must be a calendar session.
+    """
+    recommendations = _configured(lambda: load_recommendation_settings(context.env))
+    if not recommendations.enabled:
+        return None
+    if provider is not FuturesMarketDataProvider.UPSTOX:
+        raise CommandError(
+            ExitCode.CONFIGURATION,
+            f"{RECOMMENDATIONS_VARIABLE}=enabled runs only with the reviewed NSE chronological "
+            f"operation ({MARKET_DATA_PROVIDER_VARIABLE}=upstox). Nothing was run.",
+        )
+    session_settings = _configured(lambda: load_session_operation_settings(context.env))
+    if session_settings.finality_mode is not FuturesDailyBarFinalityMode.OPERATOR_REVIEWED:
+        raise CommandError(
+            ExitCode.CONFIGURATION,
+            f"{RECOMMENDATIONS_VARIABLE}=enabled requires {DAILY_BAR_FINALITY_VARIABLE}="
+            f"operator-reviewed with {APPROVED_CANDLES_VARIABLE}. Nothing was run.",
+        )
+    try:
+        configuration = select_configuration(
+            context.recommendation_configurations, recommendations, settings.strategy
+        )
+        cutoffs = operator_cutoff_source(
+            NSEFuturesTradingSessionResolver(), settings.contract, recommendations
+        )
+    except FuturesRecommendationConfigurationError as error:
+        raise CommandError(ExitCode.CONFIGURATION, str(error)) from error
+    return _RecommendationPlan(configuration, cutoffs)
+
+
+def _recommendation_cycle(
+    context: _Context,
+    log: logging.Logger,
+    settings: FuturesOperationSettings,
+    session_settings: FuturesSessionOperationSettings,
+    plan: _RecommendationPlan | None,
+    now: datetime | None,
+) -> None:
+    """Monitor, then generate, private recommendations; the caller holds the lock.
+
+    Runs after the paper workflow on both its COMPLETED and WAITING paths, so
+    an open recommendation is monitored even when no new session was decided.
+    The one captured instant bounds which sessions have closed; finality still
+    comes only from the policy. An open-recommendation anomaly or an unsafe
+    rollover is reported, then fails the run as STATE once monitoring is done.
+    """
+    if plan is None:
+        return
+    as_of = captured_instant(now if now is not None else context.clock())
+    reviewed = FuturesReviewedCandleVerification(
+        _configured(lambda: load_candle_approvals(session_settings, settings.contract.product))
+    )
+    result = run_futures_recommendation_cycle(
+        context.recommendation_runtime(settings.database),
+        contract=settings.contract,
+        strategy=settings.strategy,
+        configuration=plan.configuration,
+        cutoffs=plan.cutoffs,
+        sessions=NSEFuturesTradingSessionResolver(),
+        finality=build_daily_bar_finality_policy(session_settings),
+        reviewed=reviewed,
+        as_of=as_of,
+    )
+    context.write(cycle_lines(result))
+    outcomes = result.monitoring.outcomes
+    log.info(
+        "recommendations: %d monitored, %d step(s) recorded, generation %s",
+        len(outcomes),
+        sum(outcome.steps_recorded for outcome in outcomes),
+        "refused" if result.generation is None else result.generation.status.value,
+    )
+    if result.open_anomaly:
+        raise CommandError(
+            ExitCode.STATE,
+            f"More than one open recommendation exists on {settings.contract.product}; "
+            "each was monitored, no recommendation was generated. Investigate before the "
+            "next run.",
+        )
+    if result.rollover_contracts:
+        contracts = ", ".join(str(contract) for contract in result.rollover_contracts)
+        raise CommandError(
+            ExitCode.STATE,
+            f"Unsafe rollover: a recommendation remains open on {contracts}, which this "
+            f"operation of {settings.contract} does not acquire. No recommendation was "
+            "generated; resolve it first.",
+        )
+
+
 def _daily_operation(
     context: _Context, log: logging.Logger
 ) -> FuturesDailyOperationResult | FuturesChronologicalOperationResult:
@@ -1614,6 +1766,7 @@ def _daily_operation(
     settings = _configured(lambda: load_operation_settings(context.env))
     provider = _configured(lambda: load_market_data_provider(context.env))
     _refuse_databento_for_nse(provider, settings.contract, "operations daily")
+    recommendations = _recommendation_plan(context, settings, provider)
     if provider is FuturesMarketDataProvider.UPSTOX:
         session_settings = _configured(lambda: load_session_operation_settings(context.env))
         if session_settings.finality_mode is FuturesDailyBarFinalityMode.OPERATOR_REVIEWED:
@@ -1633,7 +1786,9 @@ def _daily_operation(
         )
         # One lock for the whole cycle -- backlog, finality, sync and every session.
         with DatabaseOperationsLock(settings.database):
-            return _chronological_daily_operation(context, log, settings, session_settings, token)
+            return _chronological_daily_operation(
+                context, log, settings, session_settings, token, recommendations
+            )
     api_key = _api_key(context, "operations daily")
     # One lock for the whole cycle -- clock, sync and paper session -- never per step.
     with DatabaseOperationsLock(settings.database):
@@ -1738,6 +1893,7 @@ def _chronological_daily_operation(
     settings: FuturesOperationSettings,
     session_settings: FuturesSessionOperationSettings,
     token: str | None,
+    recommendations: _RecommendationPlan | None = None,
 ) -> FuturesChronologicalOperationResult:
     """Process every eligible session in order; the caller holds the operations lock.
 
@@ -1836,6 +1992,7 @@ def _chronological_daily_operation(
         reason = waiting.reason if waiting is not None else "no session to process"
         context.write([*header, "", f"STATUS: WAITING -- {reason}"])
         log.info("waiting: %s", reason)
+        _recommendation_cycle(context, log, settings, session_settings, recommendations, now)
         return FuturesChronologicalOperationResult(contract, backlog, 0, (), True)
 
     first, last = backlog.eligible[0].trading_date, backlog.eligible[-1].trading_date
@@ -1916,6 +2073,7 @@ def _chronological_daily_operation(
     if waiting is not None:
         status.append(f"Waiting at {waiting.session.trading_date.isoformat()}: {waiting.reason}")
     context.write(["", *status])
+    _recommendation_cycle(context, log, settings, session_settings, recommendations, now)
     return FuturesChronologicalOperationResult(
         contract, backlog, acquired.session_count, tuple(processed), valued_all
     )
@@ -2031,6 +2189,61 @@ def _operations_daily(args: argparse.Namespace, context: _Context) -> ExitCode:
         return code
 
 
+def _recommendations_expire_incomplete(args: argparse.Namespace, context: _Context) -> ExitCode:
+    """Expire one open recommendation with an operator's incomplete-coverage declaration.
+
+    The same gates as the daily cycle apply before the lock: the feature
+    enabled, the reviewed NSE operation and an approved configuration. Under the
+    operations lock the monitor runs with exactly this one declaration, which
+    takes effect only for a lifecycle a gap holds open past its validity. It is
+    never kept in the environment, so it cannot be reapplied.
+    """
+    settings = _configured(lambda: load_operation_settings(context.env))
+    provider = _configured(lambda: load_market_data_provider(context.env))
+    _refuse_databento_for_nse(provider, settings.contract, "recommendations expire-incomplete")
+    if _recommendation_plan(context, settings, provider) is None:
+        raise CommandError(
+            ExitCode.CONFIGURATION,
+            f"Recommendation operations are disabled; set {RECOMMENDATIONS_VARIABLE}=enabled "
+            f"with {RECOMMENDATION_PROFILE_VARIABLE}. Nothing was changed.",
+        )
+    session_settings = _configured(lambda: load_session_operation_settings(context.env))
+    reviewed = FuturesReviewedCandleVerification(
+        _configured(lambda: load_candle_approvals(session_settings, settings.contract.product))
+    )
+    try:
+        declaration = FuturesIncompleteCoverageDeclaration(
+            FuturesTradeRecommendationIdentity(args.recommendation),
+            args.operator,
+            args.case,
+            args.monitor_policy,
+        )
+    except (ValidationError, InvalidFuturesRecommendationMonitoringError) as error:
+        raise CommandError(ExitCode.INPUT, f"Invalid declaration: {error}") from error
+    with DatabaseOperationsLock(settings.database):
+        _require_protection_mode(settings.database, settings.contract, session_settings)
+        outcome = run_incomplete_coverage_declaration(
+            context.recommendation_runtime(settings.database),
+            contract=settings.contract,
+            sessions=NSEFuturesTradingSessionResolver(),
+            finality=build_daily_bar_finality_policy(session_settings),
+            reviewed=reviewed,
+            as_of=captured_instant(context.clock()),
+            declaration=declaration,
+        )
+    context.write(declaration_lines(outcome))
+    if outcome.stop_reason is not (
+        FuturesRecommendationMonitoringStopReason.EXPIRED_INCOMPLETE_BY_DECLARATION
+    ):
+        raise CommandError(
+            ExitCode.STATE,
+            f"The declaration was not applied: {declaration.recommendation_identity} stopped "
+            f"at {outcome.stop_reason.value}. Expiry with incomplete coverage applies only to a "
+            "recommendation a gap holds open after its validity has ended.",
+        )
+    return ExitCode.SUCCESS
+
+
 # ---------------------------------------------------------------------------
 # Parser
 # ---------------------------------------------------------------------------
@@ -2081,7 +2294,9 @@ def build_parser() -> argparse.ArgumentParser:
         prog="northstar", description="Northstar daily futures paper trading."
     )
     groups = parser.add_subparsers(
-        dest="group", required=True, metavar="{economics,options,market-data,paper,operations}"
+        dest="group",
+        required=True,
+        metavar="{economics,options,market-data,paper,operations,recommendations}",
     )
 
     economics = groups.add_parser("economics", help="configure the economics of one dated contract")
@@ -2278,6 +2493,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     daily_parser.set_defaults(handler=_operations_daily)
 
+    recommendations = groups.add_parser(
+        "recommendations",
+        help="private futures recommendation operations (disabled unless enabled)",
+    )
+    recommendation_commands = recommendations.add_subparsers(dest="command", required=True)
+    expire_parser = recommendation_commands.add_parser(
+        "expire-incomplete",
+        help=(
+            "expire one open recommendation, held open past its validity by missing, "
+            "unapproved or unverified evidence, with an explicit operator declaration"
+        ),
+    )
+    expire_parser.add_argument("--recommendation", required=True, help="recommendation identity")
+    expire_parser.add_argument("--operator", required=True, help="accountable operator identity")
+    expire_parser.add_argument("--case", required=True, help="case, ticket or incident reference")
+    expire_parser.add_argument(
+        "--monitor-policy", required=True, help="monitor policy version the operator applied"
+    )
+    expire_parser.set_defaults(handler=_recommendations_expire_incomplete)
+
     evidence = groups.add_parser(
         "finality-evidence",
         help="collect provider evidence about daily-candle revisions; decides nothing",
@@ -2403,6 +2638,18 @@ def _classify(error: Exception) -> tuple[ExitCode, str]:
     if isinstance(error, InvalidFuturesCandleApprovalSetError):
         return ExitCode.CONFIGURATION, f"{type(error).__name__}: {error}"
     if isinstance(
+        error,
+        FuturesTradeRecommendationConfigurationConflictError
+        | FuturesRecommendationConfigurationError,
+    ):
+        return ExitCode.CONFIGURATION, f"{type(error).__name__}: {error}"
+    if isinstance(error, InvalidFuturesRecommendationMonitoringError):
+        return ExitCode.INPUT, f"{type(error).__name__}: {error}"
+    if isinstance(
+        error, FuturesRecommendationMonitoringSourceError | FuturesTradeRecommendationSourceError
+    ):
+        return ExitCode.DATA, f"{type(error).__name__}: {error}"
+    if isinstance(
         error, FuturesTradingSessionInProgressError | FuturesContractEconomicsNotFoundError
     ):
         return ExitCode.DATA, str(error)
@@ -2454,6 +2701,12 @@ def main(
     option_chain_runtime: Callable[
         [Path], BuildOptionChainSnapshotUseCase
     ] = build_option_chain_runtime,
+    recommendation_runtime: Callable[
+        [Path], FuturesRecommendationRuntime
+    ] = build_futures_recommendation_runtime,
+    recommendation_configurations: Mapping[
+        str, FuturesRecommendationConfiguration
+    ] = APPROVED_FUTURES_RECOMMENDATION_CONFIGURATIONS,
 ) -> int:
     """Run one command and return its exit code."""
     out = stdout if stdout is not None else sys.stdout
@@ -2480,6 +2733,8 @@ def main(
         option_listing_lookup=option_listing_lookup,
         option_market_data_runtime=option_market_data_runtime,
         option_chain_runtime=option_chain_runtime,
+        recommendation_runtime=recommendation_runtime,
+        recommendation_configurations=recommendation_configurations,
     )
     try:
         return args.handler(args, context)
